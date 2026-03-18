@@ -36,8 +36,10 @@ Current config fields:
 Current local state:
 
 - persistent node identity
-- enrollment metadata placeholders
-- credential metadata placeholders
+- enrollment metadata
+- runtime credential metadata in `state.json`
+- runtime credential secret in `credentials.json`
+- recent execution snapshots in `exec-history.json`
 
 ## Source layout
 
@@ -47,8 +49,10 @@ This project is intentionally separate from `or3-net` even though it integrates 
 src/
 	cli/
 	config/
+	host-control/
 	identity/
 	storage/
+	transport/
 	utils/
 tests/
 ```
@@ -60,6 +64,12 @@ The shipped CLI name stays short (`or3-node`) even though the planning docs may 
 - first milestone scope: job execution first, then remote runtime-session support
 - hostile multi-tenant isolation is out of scope
 - the agent should reuse existing `or3-net` node and runtime-session seams instead of forcing a new public API family
+
+## Transport notes
+
+- primary transport is authenticated outbound `outbound-wss`, which keeps the agent behind NAT/firewalls while allowing live execute, abort, streaming, reconnect, and heartbeat updates
+- `https` remains available as a dev/fallback transport because it is simpler to debug and useful before a live socket is attached
+- tradeoff: `https` can exercise the same request contract, but it does not provide the same continuously attached session semantics as the connected `outbound-wss` path
 
 ## Development
 

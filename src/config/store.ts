@@ -44,12 +44,30 @@ export const saveConfig = async (config: NodeAgentConfig): Promise<void> => {
 };
 
 export const loadState = async (): Promise<NodeAgentState> => {
-  const { stateFilePath } = resolveStoragePaths();
+  const { stateFilePath, credentialFilePath } = resolveStoragePaths();
   try {
-    const content = await fs.readFile(stateFilePath, "utf8");
+    const [stateContent, credentialContent] = await Promise.all([
+      fs.readFile(stateFilePath, "utf8"),
+      fs.readFile(credentialFilePath, "utf8").catch((error: unknown) => {
+        if (isMissingFileError(error)) {
+          return "";
+        }
+        throw error;
+      }),
+    ]);
+    const parsedState = JSON.parse(stateContent) as Partial<NodeAgentState>;
+    const parsedCredentials =
+      credentialContent === ""
+        ? null
+        : (JSON.parse(credentialContent) as Partial<NodeAgentState["credential"]>);
     return {
       ...defaultState(),
-      ...(JSON.parse(content) as Partial<NodeAgentState>),
+      ...parsedState,
+      credential: {
+        ...defaultState().credential,
+        ...parsedState.credential,
+        ...parsedCredentials,
+      },
     };
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
@@ -60,9 +78,34 @@ export const loadState = async (): Promise<NodeAgentState> => {
 };
 
 export const saveState = async (state: NodeAgentState): Promise<void> => {
-  const { dataDir, stateFilePath } = resolveStoragePaths();
+  const { dataDir, stateFilePath, credentialFilePath } = resolveStoragePaths();
   await fs.mkdir(dataDir, { recursive: true });
-  await fs.writeFile(stateFilePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  const persistedState: NodeAgentState = {
+    ...state,
+    credential: {
+      token: null,
+      expiresAt: state.credential.expiresAt,
+    },
+  };
+  await fs.writeFile(stateFilePath, `${JSON.stringify(persistedState, null, 2)}\n`, "utf8");
+  if (state.credential.token === null) {
+    await fs.rm(credentialFilePath, { force: true });
+    return;
+  }
+
+  await fs.writeFile(
+    credentialFilePath,
+    `${JSON.stringify(
+      {
+        token: state.credential.token,
+        expiresAt: state.credential.expiresAt,
+      },
+      null,
+      2,
+    )}\n`,
+    { encoding: "utf8", mode: 0o600 },
+  );
+  await fs.chmod(credentialFilePath, 0o600);
 };
 
 const isMissingFileError = (error: unknown): boolean =>

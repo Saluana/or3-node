@@ -6,6 +6,8 @@ export interface HostExecRequest {
   readonly env?: Readonly<Record<string, string>>;
   readonly stdin?: string;
   readonly timeoutMs?: number;
+  readonly onStdout?: (chunk: string) => void;
+  readonly onStderr?: (chunk: string) => void;
 }
 
 export interface HostExecSnapshot {
@@ -42,4 +44,5 @@ export interface HostControlConfig {
   readonly maxStdinBytes: number;
   readonly defaultTimeoutMs: number;
   readonly maxTimeoutMs: number;
+  readonly onResult?: (result: HostExecResult) => Promise<void> | void;
 }

@@ -140,4 +140,203 @@ describe("or3-node cli", () => {
     expect(stdout.join("")).toContain("bootstrap token: present");
     expect(stdout.join("")).toContain("node id: node-abc123");
   });
+
+  test("interactive launch prompts for missing values", async () => {
+    const prompts = ["prompt-token"];
+    const exitCode = await runCli(["launch"], {
+      prompt: () => prompts.shift() ?? null,
+      fetch: () =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              workspace_id: "ws_nodes",
+              node: {
+                status: "pending",
+                manifest: { node_id: "prompt-node-abc123" },
+                approved_at: null,
+              },
+              credential: null,
+            }),
+            {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            },
+          ),
+        ),
+      stdout: { write: () => true },
+      stderr: { write: () => true },
+    });
+
+    expect(exitCode).toBe(0);
+    const configPath = path.join(process.env.HOME ?? "", ".config", "or3-node", "config.json");
+    expect(await fs.readFile(configPath, "utf8")).toContain("http://127.0.0.1:3001");
+    expect(await fs.readFile(configPath, "utf8")).toContain("prompt-token");
+  });
+
+  test("launch stores credentials outside the main state file", async () => {
+    await runCli(["launch", "--url", "http://or3.test", "--token", "bootstrap-123"], {
+      fetch: () =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              workspace_id: "ws_nodes",
+              node: {
+                status: "approved",
+                manifest: { node_id: "node-abc123" },
+                approved_at: "2026-03-17T00:00:00.000Z",
+              },
+              credential: {
+                token: "or3n_secret_123",
+                expires_at: "2026-03-18T00:00:00.000Z",
+              },
+            }),
+            {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            },
+          ),
+        ),
+      stdout: { write: () => true },
+      stderr: { write: () => true },
+    });
+
+    const statePath = path.join(
+      process.env.HOME ?? "",
+      ".local",
+      "share",
+      "or3-node",
+      "state.json",
+    );
+    const credentialPath = path.join(
+      process.env.HOME ?? "",
+      ".local",
+      "share",
+      "or3-node",
+      "credentials.json",
+    );
+    expect(await fs.readFile(statePath, "utf8")).not.toContain("or3n_secret_123");
+    expect(await fs.readFile(credentialPath, "utf8")).toContain("or3n_secret_123");
+  });
+
+  test("launch refreshes near-expiry credentials on restart", async () => {
+    let redeemCount = 0;
+    const fetchImpl = (): Promise<Response> => {
+      redeemCount += 1;
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            workspace_id: "ws_nodes",
+            node: {
+              status: "approved",
+              manifest: { node_id: "node-refresh-abc123" },
+              approved_at: "2026-03-17T00:00:00.000Z",
+            },
+            credential: {
+              token: `or3n_refresh_${String(redeemCount)}`,
+              expires_at:
+                redeemCount === 1 ? "2026-03-17T00:03:00.000Z" : "2026-03-18T00:00:00.000Z",
+            },
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        ),
+      );
+    };
+
+    await runCli(["launch", "--url", "http://or3.test", "--token", "bootstrap-123"], {
+      fetch: fetchImpl,
+      stdout: { write: () => true },
+      stderr: { write: () => true },
+    });
+    await runCli(
+      ["launch", "--url", "http://or3.test", "--token", "bootstrap-123", "--no-interactive"],
+      {
+        fetch: fetchImpl,
+        stdout: { write: () => true },
+        stderr: { write: () => true },
+      },
+    );
+
+    const credentialPath = path.join(
+      process.env.HOME ?? "",
+      ".local",
+      "share",
+      "or3-node",
+      "credentials.json",
+    );
+    expect(redeemCount).toBe(2);
+    expect(await fs.readFile(credentialPath, "utf8")).toContain("or3n_refresh_2");
+  });
+
+  test("launch clears stored credentials when approval is no longer active", async () => {
+    await runCli(["launch", "--url", "http://or3.test", "--token", "bootstrap-123"], {
+      fetch: () =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              workspace_id: "ws_nodes",
+              node: {
+                status: "approved",
+                manifest: { node_id: "node-revoked-abc123" },
+                approved_at: "2026-03-17T00:00:00.000Z",
+              },
+              credential: {
+                token: "or3n_old_secret",
+                expires_at: "2026-03-17T00:03:00.000Z",
+              },
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
+        ),
+      stdout: { write: () => true },
+      stderr: { write: () => true },
+    });
+
+    await runCli(
+      ["launch", "--url", "http://or3.test", "--token", "bootstrap-123", "--no-interactive"],
+      {
+        fetch: () =>
+          Promise.resolve(
+            new Response(
+              JSON.stringify({
+                workspace_id: "ws_nodes",
+                node: {
+                  status: "pending",
+                  manifest: { node_id: "node-revoked-abc123" },
+                  approved_at: null,
+                },
+                credential: null,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            ),
+          ),
+        stdout: { write: () => true },
+        stderr: { write: () => true },
+      },
+    );
+
+    const statePath = path.join(
+      process.env.HOME ?? "",
+      ".local",
+      "share",
+      "or3-node",
+      "state.json",
+    );
+    const credentialPath = path.join(
+      process.env.HOME ?? "",
+      ".local",
+      "share",
+      "or3-node",
+      "credentials.json",
+    );
+    expect(await fs.readFile(statePath, "utf8")).toContain('"expiresAt": null');
+    try {
+      await fs.readFile(credentialPath, "utf8");
+      throw new Error("expected credential file to be removed");
+    } catch (error: unknown) {
+      expect(error).toBeInstanceOf(Error);
+    }
+  });
 });

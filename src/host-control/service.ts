@@ -144,11 +144,13 @@ export class HostControlService {
       const next = appendBounded(stdout, chunk, this.config.maxStdoutBytes);
       stdout = next.value;
       truncationCount += Number(next.truncated);
+      input.onStdout?.(chunk);
     });
     child.stderr.on("data", (chunk: string) => {
       const next = appendBounded(stderr, chunk, this.config.maxStderrBytes);
       stderr = next.value;
       truncationCount += Number(next.truncated);
+      input.onStderr?.(chunk);
     });
 
     if (stdin.length > 0) {
@@ -224,6 +226,7 @@ export class HostControlService {
       truncated: truncationCount > 0,
     };
     this.completedExecs.set(execId, result);
+    await this.config.onResult?.(result);
     return result;
   }
 }

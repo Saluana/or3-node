@@ -4,10 +4,12 @@ import { buildSignedManifest } from "../enroll/manifest.ts";
 import { ensureIdentity, resetIdentity } from "../identity/store.ts";
 import { loadConfig, loadState, saveConfig, saveState } from "../config/store.ts";
 import type { LaunchCommandOptions, NodeAgentConfig } from "../config/types.ts";
+import { collectAgentInfo, formatAgentInfo } from "../info/agent-info.ts";
 import { CliUsageError } from "../utils/errors.ts";
 
 export interface CliDependencies {
   readonly fetch?: FetchLike;
+  readonly prompt?: (message: string) => string | null;
   readonly stdout?: Pick<typeof process.stdout, "write">;
   readonly stderr?: Pick<typeof process.stderr, "write">;
 }
@@ -19,6 +21,7 @@ export const runCli = async (
   const stdout = dependencies.stdout ?? process.stdout;
   const stderr = dependencies.stderr ?? process.stderr;
   const fetchImpl: FetchLike = dependencies.fetch ?? fetch;
+  const promptImpl = dependencies.prompt ?? globalThis.prompt;
 
   try {
     const [command, ...rest] = argv;
@@ -29,9 +32,11 @@ export const runCli = async (
         stdout.write(renderHelp());
         return 0;
       case "launch":
-        return await handleLaunch(rest, stdout, fetchImpl);
+        return await handleLaunch(rest, stdout, fetchImpl, promptImpl);
       case "doctor":
         return await handleDoctor(stdout);
+      case "info":
+        return await handleInfo(stdout);
       case "status":
         return await handleStatus(stdout);
       case "reset":
@@ -49,16 +54,17 @@ const handleLaunch = async (
   argv: readonly string[],
   stdout: Pick<typeof process.stdout, "write">,
   fetchImpl: FetchLike,
+  promptImpl: ((message: string) => string | null) | undefined,
 ): Promise<number> => {
   const options = parseLaunchOptions(argv);
   const identity = await ensureIdentity();
   const [config, state] = await Promise.all([loadConfig(), loadState()]);
-  const mergedConfig = mergeConfig(config, options);
+  const mergedConfig = resolveLaunchConfig(config, options, promptImpl);
   await saveConfig(mergedConfig);
   const manifest = buildSignedManifest(identity, mergedConfig);
 
   let nextState = state;
-  if (mergedConfig.bootstrapToken !== null) {
+  if (mergedConfig.bootstrapToken !== null && shouldRedeemBootstrap(nextState)) {
     const redemption = await redeemBootstrapToken(
       mergedConfig.controlPlaneUrl,
       mergedConfig.bootstrapToken,
@@ -71,7 +77,10 @@ const handleLaunch = async (
       approvedAt: redemption.node.approved_at,
       credential:
         redemption.credential === null
-          ? state.credential
+          ? {
+              token: null,
+              expiresAt: null,
+            }
           : {
               token: redemption.credential.token,
               expiresAt: redemption.credential.expires_at,
@@ -107,6 +116,13 @@ const handleDoctor = async (stdout: Pick<typeof process.stdout, "write">): Promi
   stdout.write(`identity: ${identity.publicKeyBase64.slice(0, 16)}…\n`);
   stdout.write(`node id: ${state.nodeId ?? "not enrolled"}\n`);
   stdout.write(`credential: ${state.credential.token === null ? "missing" : "present"}\n`);
+  return 0;
+};
+
+const handleInfo = async (stdout: Pick<typeof process.stdout, "write">): Promise<number> => {
+  const config = await loadConfig();
+  const info = collectAgentInfo(config);
+  stdout.write(formatAgentInfo(info));
   return 0;
 };
 
@@ -177,6 +193,38 @@ const mergeConfig = (config: NodeAgentConfig, options: LaunchCommandOptions): No
   allowedEnvNames: config.allowedEnvNames,
 });
 
+const resolveLaunchConfig = (
+  config: NodeAgentConfig,
+  options: LaunchCommandOptions,
+  promptImpl: ((message: string) => string | null) | undefined,
+): NodeAgentConfig => {
+  const merged = mergeConfig(config, options);
+  if (!options.interactive) {
+    return merged;
+  }
+
+  return {
+    ...merged,
+    controlPlaneUrl: merged.controlPlaneUrl,
+    bootstrapToken:
+      merged.bootstrapToken ??
+      resolveOptionalPromptValue(promptImpl, "Bootstrap token (leave empty to skip)", null),
+    nodeName: merged.nodeName,
+  };
+};
+
+const resolveOptionalPromptValue = (
+  promptImpl: ((message: string) => string | null) | undefined,
+  label: string,
+  fallback: string | null,
+): string | null => {
+  if (promptImpl === undefined) {
+    return fallback;
+  }
+  const response = promptImpl(`${label}:`)?.trim();
+  return response === undefined || response === "" ? fallback : response;
+};
+
 const renderHelp = (): string =>
   [
     "or3-node",
@@ -184,6 +232,7 @@ const renderHelp = (): string =>
     "Commands:",
     "  launch [--url <url>] [--token <token>] [--name <name>] [--foreground] [--no-interactive]",
     "  doctor",
+    "  info",
     "  status",
     "  reset",
     "",
@@ -191,3 +240,11 @@ const renderHelp = (): string =>
 
 const toErrorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : "unknown error";
+
+const shouldRedeemBootstrap = (state: Awaited<ReturnType<typeof loadState>>): boolean => {
+  if (state.credential.token === null || state.credential.expiresAt === null) {
+    return true;
+  }
+
+  return new Date(state.credential.expiresAt).getTime() <= Date.now() + 5 * 60_000;
+};
