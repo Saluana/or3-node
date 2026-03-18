@@ -7,8 +7,15 @@
  * and for embedding in heartbeat/handshake metadata.
  */
 import os from "node:os";
+import { createRequire } from "node:module";
 
 import type { NodeAgentConfig } from "../config/types.ts";
+
+const require = createRequire(import.meta.url);
+
+const packageMetadata = require("../../package.json") as { version?: string };
+
+const AGENT_VERSION = packageMetadata.version ?? "0.0.0";
 
 export interface AgentInfo {
   readonly version: string;
@@ -46,7 +53,7 @@ export const collectAgentInfo = (
   capabilities.push("service-launch");
 
   return {
-    version: "1.0.0",
+    version: AGENT_VERSION,
     platform: process.platform,
     arch: os.arch(),
     hostname: os.hostname(),

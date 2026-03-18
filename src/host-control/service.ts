@@ -13,6 +13,7 @@ import type {
 } from "./types.ts";
 import { resolveAllowedWorkingDirectory } from "./paths.ts";
 import { ConfigError } from "../utils/errors.ts";
+import { AgentEvent, createNoopAgentLogger, type AgentLogger } from "../utils/logger.ts";
 
 const DEFAULT_CONFIG: HostControlConfig = {
   allowedRoots: [],
@@ -29,12 +30,14 @@ export class HostControlService {
   private readonly config: HostControlConfig;
   private readonly activeExecs = new Map<string, { abort: () => void }>();
   private readonly completedExecs = new Map<string, HostExecResult>();
+  private readonly logger: AgentLogger;
 
   public constructor(config: Partial<HostControlConfig> = {}) {
     this.config = {
       ...DEFAULT_CONFIG,
       ...config,
     };
+    this.logger = config.logger ?? createNoopAgentLogger();
   }
 
   public getConfig(): HostControlConfig {
@@ -50,51 +53,72 @@ export class HostControlService {
   }
 
   public exec(input: HostExecRequest): Promise<HostExecHandle> {
-    const [command, ...args] = input.argv;
-    if (command === undefined) {
-      throw new ConfigError("argv must contain at least one executable");
-    }
-    if (this.activeExecs.size >= this.config.maxConcurrentExecs) {
-      throw new ConfigError("too many concurrent execs");
-    }
+    try {
+      const [command, ...args] = input.argv;
+      if (command === undefined) {
+        throw new ConfigError("argv must contain at least one executable");
+      }
+      if (this.activeExecs.size >= this.config.maxConcurrentExecs) {
+        throw new ConfigError("too many concurrent execs");
+      }
 
-    const stdin = input.stdin ?? "";
-    if (Buffer.byteLength(stdin, "utf8") > this.config.maxStdinBytes) {
-      throw new ConfigError("stdin exceeds configured maxStdinBytes");
+      const stdin = input.stdin ?? "";
+      if (Buffer.byteLength(stdin, "utf8") > this.config.maxStdinBytes) {
+        throw new ConfigError("stdin exceeds configured maxStdinBytes");
+      }
+      if (input.env !== undefined) {
+        validateRequestedEnv(input.env, this.config.allowedEnvPassthrough);
+      }
+
+      const execId = createId("hostexec");
+      const cwd = resolveAllowedWorkingDirectory(input.cwd, this.config.allowedRoots);
+      const timeoutMs = Math.min(
+        input.timeoutMs ?? this.config.defaultTimeoutMs,
+        this.config.maxTimeoutMs,
+      );
+      this.logger.info(AgentEvent.EXEC_START, "host execution started", {
+        exec_id: execId,
+        argv: [...input.argv],
+        cwd,
+        timeout_ms: timeoutMs,
+      });
+
+      let abortProcess: () => void = () => {
+        return;
+      };
+      this.activeExecs.set(execId, {
+        abort: () => {
+          abortProcess();
+        },
+      });
+
+      const result = this.runProcess(
+        execId,
+        command,
+        args,
+        input,
+        cwd,
+        stdin,
+        timeoutMs,
+        (abort) => {
+          abortProcess = abort;
+        },
+      ).finally(() => {
+        this.activeExecs.delete(execId);
+      });
+
+      return Promise.resolve({
+        execId,
+        result,
+        abort: (): Promise<void> => {
+          this.activeExecs.get(execId)?.abort();
+          return Promise.resolve();
+        },
+      });
+    } catch (error: unknown) {
+      this.logExecSetupFailure(input, error);
+      throw error;
     }
-    if (input.env !== undefined) {
-      validateRequestedEnv(input.env, this.config.allowedEnvPassthrough);
-    }
-
-    const execId = createId("hostexec");
-    const cwd = resolveAllowedWorkingDirectory(input.cwd, this.config.allowedRoots);
-    const timeoutMs = Math.min(
-      input.timeoutMs ?? this.config.defaultTimeoutMs,
-      this.config.maxTimeoutMs,
-    );
-    let abortProcess: () => void = () => {
-      return;
-    };
-    this.activeExecs.set(execId, {
-      abort: () => {
-        abortProcess();
-      },
-    });
-
-    const result = this.runProcess(execId, command, args, input, cwd, stdin, timeoutMs, (abort) => {
-      abortProcess = abort;
-    }).finally(() => {
-      this.activeExecs.delete(execId);
-    });
-
-    return Promise.resolve({
-      execId,
-      result,
-      abort: (): Promise<void> => {
-        this.activeExecs.get(execId)?.abort();
-        return Promise.resolve();
-      },
-    });
   }
 
   private async runProcess(
@@ -190,6 +214,15 @@ export class HostControlService {
           signal: null,
           truncated: truncationCount > 0,
         };
+        this.logger.error(AgentEvent.EXEC_FINISH, "host execution failed before exit", {
+          exec_id: execId,
+          argv: [...input.argv],
+          cwd,
+          status: result.status,
+          error: result.stderr,
+          truncated: result.truncated,
+          failure_class: "exec",
+        });
         this.completedExecs.set(execId, result);
         return null;
       });
@@ -226,8 +259,70 @@ export class HostControlService {
       truncated: truncationCount > 0,
     };
     this.completedExecs.set(execId, result);
+    this.logExecResult(result);
     await this.config.onResult?.(result);
     return result;
+  }
+
+  private logExecSetupFailure(input: HostExecRequest, error: unknown): void {
+    const errorMessage = toErrorMessage(error);
+    if (isPathViolationMessage(errorMessage)) {
+      this.logger.error(AgentEvent.PATH_VIOLATION, "host execution blocked by path policy", {
+        argv: [...input.argv],
+        cwd: input.cwd ?? null,
+        error: errorMessage,
+        failure_class: "path_violation",
+      });
+      return;
+    }
+
+    this.logger.error(AgentEvent.CONFIG_FAIL, "host execution rejected by config", {
+      argv: [...input.argv],
+      cwd: input.cwd ?? null,
+      error: errorMessage,
+      failure_class: "config",
+    });
+  }
+
+  private logExecResult(result: HostExecResult): void {
+    const details = {
+      exec_id: result.execId,
+      argv: [...result.argv],
+      cwd: result.cwd,
+      status: result.status,
+      exit_code: result.exitCode,
+      signal: result.signal,
+      truncated: result.truncated,
+    };
+
+    switch (result.status) {
+      case "running":
+        return;
+      case "completed":
+        this.logger.info(AgentEvent.EXEC_FINISH, "host execution completed", details);
+        return;
+      case "aborted":
+        this.logger.warn(AgentEvent.EXEC_ABORT, "host execution aborted", {
+          ...details,
+          failure_class: "exec",
+        });
+        return;
+      case "timed_out":
+        this.logger.warn(AgentEvent.EXEC_TIMEOUT, "host execution timed out", {
+          ...details,
+          failure_class: "exec",
+        });
+        return;
+      case "failed":
+        this.logger.error(AgentEvent.EXEC_FINISH, "host execution failed", {
+          ...details,
+          stderr: result.stderrPreview,
+          failure_class: "exec",
+        });
+        return;
+      default:
+        return;
+    }
   }
 }
 
@@ -274,3 +369,6 @@ const toSnapshot = (result: HostExecResult): HostExecSnapshot => ({
 
 const toErrorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : "unknown error";
+
+const isPathViolationMessage = (message: string): boolean =>
+  message.includes("outside allowed roots");

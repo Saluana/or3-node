@@ -67,6 +67,7 @@ The machine sends that token, along with a signed description of itself, to `or3
 That description is called a **manifest**.
 
 A manifest is basically a facts sheet:
+
 - who the machine says it is
 - what version it is running
 - what features it supports
@@ -86,6 +87,7 @@ Approval is the trust gate.
 Once approved, the control plane can hand the machine a runtime credential that is meant for normal ongoing use.
 
 That gives the project a clean trust model:
+
 - bootstrap token = get in the door once
 - runtime credential = do your normal day-to-day work after approval
 
@@ -96,6 +98,7 @@ That gives the project a clean trust model:
 After approval, `or3-node` connects back to `or3-net` over a long-lived connection, usually WebSocket-based.
 
 Think of this like a walkie-talkie that stays open:
+
 - the machine can say “I’m still here” using heartbeats
 - the control plane can send work quickly
 - both sides can notice disconnects
@@ -109,6 +112,7 @@ It lets machines behind NAT, firewalls, or home internet setups stay controllabl
 ## What the control plane actually sends
 
 Once the machine is connected, `or3-net` can send requests such as:
+
 - run a command
 - stop a command
 - create a session
@@ -128,6 +132,7 @@ A **runtime session** is just a named period of work with continuity.
 
 Instead of saying “run this one command and forget everything,” a session lets OR3 keep some shared context around a machine interaction.
 That is helpful for:
+
 - a sequence of commands
 - collecting logs
 - keeping a working directory or process context alive
@@ -145,6 +150,7 @@ If you have ever used a command prompt, shell, or terminal, that is the idea.
 Why would OR3 need this?
 Because some kinds of remote control are not just “run one command and wait.”
 Sometimes you want a more interactive experience:
+
 - type input
 - resize the terminal
 - see output as it appears
@@ -159,6 +165,7 @@ Some platforms can support it better than others.
 
 Not every computer can or should do everything.
 Some machines may support:
+
 - command execution
 - reading files
 - writing files
@@ -177,6 +184,7 @@ It is better to say “this machine does not support PTY” than to pretend it d
 
 This agent runs on a real computer, so it has to behave carefully.
 That is why the design keeps mentioning limits such as:
+
 - timeouts
 - maximum output size
 - maximum stdin size
@@ -216,6 +224,7 @@ That is the heart of the whole system.
 ## What the current `or3-node` codebase already has
 
 Today’s repository already includes a lot of the building blocks:
+
 - a CLI with `launch`, `doctor`, `info`, `status`, and `reset`
 - local config and state storage
 - persistent machine identity
@@ -244,6 +253,7 @@ or3-node launch
 That is clearly the north star.
 
 But the current implementation still has a few obvious gaps between the plan and the present code:
+
 - `launch` still reports that the agent loop is not started yet
 - `--foreground` exists but does not yet visibly change behavior
 - structured logging exists but is not yet deeply wired into the main flows
@@ -266,6 +276,7 @@ If you only remember one idea, remember this:
 
 That separation is what makes the whole project understandable.
 It is also what keeps the system flexible:
+
 - the control plane can stay stable
 - the machine agent can grow richer capabilities over time
 - users get a consistent OR3 experience whether work runs in a sandbox, a runtime session, or a real installed machine
@@ -278,6 +289,7 @@ This project exists because real computers are messy.
 They can sit behind routers, have different operating systems, expose different capabilities, and go offline unexpectedly.
 
 The OR3 architecture handles that by:
+
 - keeping trust and scheduling centralized
 - keeping machine-specific work local
 - using signed identity and approval gates
@@ -293,6 +305,7 @@ It gives OR3 a way to control real machines using the same high-level control-pl
 ## Final takeaway
 
 If OR3 were a movie:
+
 - `or3-net` would be mission control
 - `or3-node` would be the field agent on the ground
 

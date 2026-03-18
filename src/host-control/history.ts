@@ -30,6 +30,11 @@ export class HostExecHistoryStore {
   }
 }
 
+export const resetHostExecHistory = async (): Promise<void> => {
+  const { execHistoryFilePath } = resolveStoragePaths();
+  await fs.rm(execHistoryFilePath, { force: true });
+};
+
 const toSnapshot = (result: HostExecResult): HostExecSnapshot => ({
   execId: result.execId,
   argv: result.argv,

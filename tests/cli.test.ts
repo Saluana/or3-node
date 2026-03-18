@@ -4,7 +4,9 @@ import os from "node:os";
 import path from "node:path";
 
 import { runCli } from "../src/cli/index.ts";
+import { saveState } from "../src/config/store.ts";
 import { resolveStoragePaths } from "../src/storage/paths.ts";
+import type { LogEntry } from "../src/utils/logger.ts";
 
 const tempHomes: string[] = [];
 
@@ -33,6 +35,25 @@ const createWriter = (): {
   };
 };
 
+const parseLogEntries = (chunks: readonly string[]): LogEntry[] =>
+  chunks
+    .join("")
+    .trim()
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line) as LogEntry);
+
+const expectMissingFile = async (filePath: string): Promise<void> => {
+  let exists = true;
+  try {
+    await fs.access(filePath);
+  } catch {
+    exists = false;
+  }
+
+  expect(exists).toBe(false);
+};
+
 const pendingBootstrapResponse = (nodeId = "node-pending-abc123"): Response =>
   new Response(
     JSON.stringify({
@@ -53,7 +74,7 @@ const pendingBootstrapResponse = (nodeId = "node-pending-abc123"): Response =>
 const approvedBootstrapResponse = (
   nodeId = "node-approved-abc123",
   token = "or3n_secret_123",
-  expiresAt = "2026-03-18T00:00:00.000Z",
+  expiresAt = new Date(Date.now() + 24 * 60 * 60_000).toISOString(),
 ): Response =>
   new Response(
     JSON.stringify({
@@ -61,7 +82,7 @@ const approvedBootstrapResponse = (
       node: {
         status: "approved",
         manifest: { node_id: nodeId },
-        approved_at: "2026-03-17T00:00:00.000Z",
+        approved_at: new Date(Date.now() - 60_000).toISOString(),
       },
       credential: {
         token,
@@ -114,11 +135,77 @@ describe("or3-node cli", () => {
       'next step: approve this node in or3-net, then run "or3-node launch --foreground"',
     );
 
-    const { configFilePath: configPath, identityFilePath: identityPath, stateFilePath: statePath } =
-      resolveStoragePaths();
+    const {
+      configFilePath: configPath,
+      identityFilePath: identityPath,
+      stateFilePath: statePath,
+    } = resolveStoragePaths();
     expect(await fs.readFile(configPath, "utf8")).toContain("http://or3.test");
     expect(await fs.readFile(identityPath, "utf8")).toContain("publicKeyBase64");
     expect(await fs.readFile(statePath, "utf8")).toContain("devbox-abc123");
+  });
+
+  test("launch emits structured bootstrap, approval, and credential logs", async () => {
+    const stderr = createWriter();
+
+    const exitCode = await runCli(
+      ["launch", "--url", "http://or3.test", "--token", "bootstrap-123"],
+      {
+        fetch: () => Promise.resolve(approvedBootstrapResponse()),
+        backgroundLauncher: () => undefined,
+        stdout: { write: () => true },
+        stderr: stderr.writer,
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    const entries = parseLogEntries(stderr.chunks);
+    expect(entries.some((entry) => entry.event === "bootstrap.start")).toBe(true);
+    expect(entries.some((entry) => entry.event === "bootstrap.success")).toBe(true);
+    expect(entries.some((entry) => entry.event === "approval.received")).toBe(true);
+    expect(entries.some((entry) => entry.event === "credential.refreshed")).toBe(true);
+  });
+
+  test("launch classifies pending approval in structured logs", async () => {
+    const stderr = createWriter();
+
+    const exitCode = await runCli(
+      ["launch", "--url", "http://or3.test", "--token", "bootstrap-123"],
+      {
+        fetch: () => Promise.resolve(pendingBootstrapResponse()),
+        stdout: { write: () => true },
+        stderr: stderr.writer,
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    const entries = parseLogEntries(stderr.chunks);
+    expect(
+      entries.some(
+        (entry) =>
+          entry.event === "bootstrap.success" && entry.details?.failure_class === "approval",
+      ),
+    ).toBe(true);
+  });
+
+  test("launch bootstrap failures stay single-classified in structured logs", async () => {
+    const stderr = createWriter();
+
+    const exitCode = await runCli(
+      ["launch", "--url", "http://or3.test", "--token", "bootstrap-123"],
+      {
+        fetch: () => Promise.reject(new Error("bootstrap network failed")),
+        stdout: { write: () => true },
+        stderr: stderr.writer,
+      },
+    );
+
+    expect(exitCode).toBe(1);
+    const entries = parseLogEntries(stderr.chunks);
+    expect(entries).toHaveLength(2);
+    expect(entries[0]?.event).toBe("bootstrap.start");
+    expect(entries[1]?.event).toBe("bootstrap.fail");
+    expect(entries.some((entry) => entry.event === "config.fail")).toBe(false);
   });
 
   test("doctor reports the next step when approval is still pending", async () => {
@@ -137,7 +224,7 @@ describe("or3-node cli", () => {
     expect(exitCode).toBe(0);
     expect(stdout.chunks.join("")).toContain("control plane url: http://or3.test");
     expect(stdout.chunks.join("")).toContain("bootstrap token: present");
-    expect(stdout.chunks.join("")).toContain("node id: node-pending-abc123");
+    expect(stdout.chunks.join("")).toContain("node id:          node-pending-abc123");
     expect(stdout.chunks.join("")).toContain(
       'next step: approve this node in or3-net, then run "or3-node launch --foreground"',
     );
@@ -157,9 +244,78 @@ describe("or3-node cli", () => {
     });
 
     expect(exitCode).toBe(0);
-    expect(stdout.chunks.join("")).toContain("approved at: pending");
+    expect(stdout.chunks.join("")).toContain("enrollment:       enrolled");
+    expect(stdout.chunks.join("")).toContain("approval:         pending");
+    expect(stdout.chunks.join("")).toContain("credential:       missing");
+    expect(stdout.chunks.join("")).toContain("connection:       unknown");
+    expect(stdout.chunks.join("")).toContain("approved at:      pending");
     expect(stdout.chunks.join("")).toContain(
       'next step: approve this node in or3-net, then run "or3-node launch --foreground"',
+    );
+  });
+
+  test("info reports the package version and lifecycle summary", async () => {
+    const stdout = createWriter();
+
+    const exitCode = await runCli(["info"], {
+      stdout: stdout.writer,
+      stderr: { write: () => true },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(stdout.chunks.join("")).toContain("version:          0.1.0");
+    expect(stdout.chunks.join("")).toContain("enrollment:       not enrolled");
+    expect(stdout.chunks.join("")).toContain("approval:         not enrolled");
+    expect(stdout.chunks.join("")).toContain("credential:       missing");
+    expect(stdout.chunks.join("")).toContain("connection:       unknown");
+  });
+
+  test("status shows approved and valid runtime state clearly", async () => {
+    const stdout = createWriter();
+
+    await runCli(["launch", "--url", "http://or3.test", "--token", "bootstrap-123"], {
+      fetch: () => Promise.resolve(approvedBootstrapResponse()),
+      backgroundLauncher: () => undefined,
+      stdout: { write: () => true },
+      stderr: { write: () => true },
+    });
+
+    const exitCode = await runCli(["status"], {
+      stdout: stdout.writer,
+      stderr: { write: () => true },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(stdout.chunks.join("")).toContain("enrollment:       enrolled");
+    expect(stdout.chunks.join("")).toContain("approval:         approved");
+    expect(stdout.chunks.join("")).toContain("credential:       valid");
+    expect(stdout.chunks.join("")).toContain("connection:       unknown");
+    expect(stdout.chunks.join("")).toContain(
+      'next step: run "or3-node launch" to start the background agent, or use "--foreground" to keep it attached here',
+    );
+  });
+
+  test("status marks expired credentials and points to refresh", async () => {
+    await saveState({
+      nodeId: "node-expired-abc123",
+      enrolledAt: "2026-03-17T00:00:00.000Z",
+      approvedAt: "2026-03-17T00:00:00.000Z",
+      credential: {
+        token: "or3n_expired_secret",
+        expiresAt: "2026-03-17T00:00:00.000Z",
+      },
+    });
+
+    const stdout = createWriter();
+    const exitCode = await runCli(["status"], {
+      stdout: stdout.writer,
+      stderr: { write: () => true },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(stdout.chunks.join("")).toContain("credential:       expired");
+    expect(stdout.chunks.join("")).toContain(
+      'next step: run "or3-node launch" to refresh runtime credentials',
     );
   });
 
@@ -199,7 +355,9 @@ describe("or3-node cli", () => {
         approvedBootstrapResponse(
           "node-refresh-abc123",
           `or3n_refresh_${String(redeemCount)}`,
-          redeemCount === 1 ? "2026-03-17T00:03:00.000Z" : "2026-03-18T00:00:00.000Z",
+          redeemCount === 1
+            ? new Date(Date.now() + 3 * 60_000).toISOString()
+            : new Date(Date.now() + 24 * 60 * 60_000).toISOString(),
         ),
       );
     };
@@ -227,7 +385,14 @@ describe("or3-node cli", () => {
 
   test("launch clears stored credentials when approval is no longer active", async () => {
     await runCli(["launch", "--url", "http://or3.test", "--token", "bootstrap-123"], {
-      fetch: () => Promise.resolve(approvedBootstrapResponse("node-revoked-abc123", "or3n_old_secret")),
+      fetch: () =>
+        Promise.resolve(
+          approvedBootstrapResponse(
+            "node-revoked-abc123",
+            "or3n_old_secret",
+            new Date(Date.now() + 60_000).toISOString(),
+          ),
+        ),
       backgroundLauncher: () => undefined,
       stdout: { write: () => true },
       stderr: { write: () => true },
@@ -256,14 +421,17 @@ describe("or3-node cli", () => {
     const spawnedCommands: string[][] = [];
     const stdout = createWriter();
 
-    const exitCode = await runCli(["launch", "--url", "http://or3.test", "--token", "bootstrap-123"], {
-      fetch: () => Promise.resolve(approvedBootstrapResponse()),
-      backgroundLauncher: (argv) => {
-        spawnedCommands.push([...argv]);
+    const exitCode = await runCli(
+      ["launch", "--url", "http://or3.test", "--token", "bootstrap-123"],
+      {
+        fetch: () => Promise.resolve(approvedBootstrapResponse()),
+        backgroundLauncher: (argv) => {
+          spawnedCommands.push([...argv]);
+        },
+        stdout: stdout.writer,
+        stderr: { write: () => true },
       },
-      stdout: stdout.writer,
-      stderr: { write: () => true },
-    });
+    );
 
     expect(exitCode).toBe(0);
     expect(spawnedCommands).toEqual([["launch", "--foreground", "--no-interactive"]]);
@@ -280,7 +448,8 @@ describe("or3-node cli", () => {
     const exitCode = await runCli(
       ["launch", "--url", "http://or3.test", "--token", "bootstrap-123", "--foreground"],
       {
-        fetch: () => Promise.resolve(approvedBootstrapResponse("node-foreground-abc123", "or3n_foreground")),
+        fetch: () =>
+          Promise.resolve(approvedBootstrapResponse("node-foreground-abc123", "or3n_foreground")),
         agentLoopFactory: () => ({
           start: () => {
             started = true;
@@ -296,5 +465,53 @@ describe("or3-node cli", () => {
     expect(started).toBeTrue();
     expect(stdout.chunks.join("")).toContain("agent loop: starting in foreground");
     expect(stdout.chunks.join("")).toContain("agent loop: stopped");
+  });
+
+  test("reset clears local enrollment state while preserving operator config", async () => {
+    await runCli(
+      ["launch", "--url", "http://or3.test", "--token", "bootstrap-123", "--name", "devbox"],
+      {
+        fetch: () =>
+          Promise.resolve(approvedBootstrapResponse("node-reset-abc123", "or3n_reset_secret")),
+        backgroundLauncher: () => undefined,
+        stdout: { write: () => true },
+        stderr: { write: () => true },
+      },
+    );
+
+    const {
+      configFilePath: configPath,
+      stateFilePath: statePath,
+      credentialFilePath: credentialPath,
+      identityFilePath: identityPath,
+      execHistoryFilePath: execHistoryPath,
+    } = resolveStoragePaths();
+    await fs.writeFile(execHistoryPath, '[{"execId":"exec-1"}]\n', "utf8");
+
+    const stdout = createWriter();
+    const exitCode = await runCli(["reset"], {
+      stdout: stdout.writer,
+      stderr: { write: () => true },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(stdout.chunks.join("")).toContain("local node state reset");
+    expect(stdout.chunks.join("")).toContain(
+      "cleared: identity, enrollment state, runtime credentials, bootstrap token, exec history",
+    );
+
+    const config = JSON.parse(await fs.readFile(configPath, "utf8")) as {
+      controlPlaneUrl: string;
+      bootstrapToken: string | null;
+      nodeName: string | null;
+    };
+    expect(config.controlPlaneUrl).toBe("http://or3.test");
+    expect(config.nodeName).toBe("devbox");
+    expect(config.bootstrapToken).toBeNull();
+
+    await expectMissingFile(statePath);
+    await expectMissingFile(credentialPath);
+    await expectMissingFile(identityPath);
+    await expectMissingFile(execHistoryPath);
   });
 });

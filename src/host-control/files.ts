@@ -9,12 +9,14 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 
 import { ConfigError } from "../utils/errors.ts";
+import { AgentEvent, createNoopAgentLogger, type AgentLogger } from "../utils/logger.ts";
 
 const DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024;
 
 export interface HostFileServiceConfig {
   readonly allowedRoots: readonly string[];
   readonly maxFileBytes?: number;
+  readonly logger?: AgentLogger;
 }
 
 export interface FileReadResult {
@@ -40,10 +42,12 @@ export interface FileEntry {
 export class HostFileService {
   private readonly config: HostFileServiceConfig;
   private readonly maxFileBytes: number;
+  private readonly logger: AgentLogger;
 
   public constructor(config: HostFileServiceConfig) {
     this.config = config;
     this.maxFileBytes = config.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
+    this.logger = config.logger ?? createNoopAgentLogger();
   }
 
   public isEnabled(): boolean {
@@ -54,68 +58,98 @@ export class HostFileService {
     filePath: string,
     encoding: "text" | "base64" = "text",
   ): Promise<FileReadResult> {
-    const resolved = await this.resolveAllowedPath(filePath);
-    const stat = await fs.stat(resolved);
-    if (!stat.isFile()) {
-      throw new ConfigError(`not a file: ${resolved}`);
+    try {
+      const resolved = await this.resolveAllowedPath(filePath);
+      const stat = await fs.stat(resolved);
+      if (!stat.isFile()) {
+        throw new ConfigError(`not a file: ${resolved}`);
+      }
+      if (stat.size > this.maxFileBytes) {
+        throw new ConfigError(
+          `file exceeds size cap (${String(stat.size)} > ${String(this.maxFileBytes)}): ${resolved}`,
+        );
+      }
+      const buffer = await fs.readFile(resolved);
+      const result: FileReadResult = {
+        path: resolved,
+        encoding,
+        ...(encoding === "text"
+          ? { content_text: buffer.toString("utf8") }
+          : { content_base64: buffer.toString("base64") }),
+        size_bytes: buffer.byteLength,
+      };
+      this.logger.info(AgentEvent.FILE_READ, "host file read completed", {
+        path: result.path,
+        encoding: result.encoding,
+        size_bytes: result.size_bytes,
+      });
+      return result;
+    } catch (error: unknown) {
+      this.logFileFailure(AgentEvent.FILE_READ, "host file read failed", filePath, error);
+      throw error;
     }
-    if (stat.size > this.maxFileBytes) {
-      throw new ConfigError(
-        `file exceeds size cap (${String(stat.size)} > ${String(this.maxFileBytes)}): ${resolved}`,
-      );
-    }
-    const buffer = await fs.readFile(resolved);
-    return {
-      path: resolved,
-      encoding,
-      ...(encoding === "text"
-        ? { content_text: buffer.toString("utf8") }
-        : { content_base64: buffer.toString("base64") }),
-      size_bytes: buffer.byteLength,
-    };
   }
 
   public async write(
     filePath: string,
     options: { content_text?: string; content_base64?: string; overwrite?: boolean },
   ): Promise<FileWriteResult> {
-    const resolved = await this.resolveAllowedPath(filePath, { allowMissingLeaf: true });
-    const buffer =
-      options.content_base64 !== undefined
-        ? Buffer.from(options.content_base64, "base64")
-        : Buffer.from(options.content_text ?? "", "utf8");
-    if (buffer.byteLength > this.maxFileBytes) {
-      throw new ConfigError(
-        `content exceeds size cap (${String(buffer.byteLength)} > ${String(this.maxFileBytes)})`,
-      );
-    }
-    if (options.overwrite === false) {
-      try {
-        await fs.access(resolved);
-        throw new ConfigError(`file already exists and overwrite is disabled: ${resolved}`);
-      } catch (error: unknown) {
-        if (error instanceof ConfigError) {
-          throw error;
+    try {
+      const resolved = await this.resolveAllowedPath(filePath, { allowMissingLeaf: true });
+      const buffer =
+        options.content_base64 !== undefined
+          ? Buffer.from(options.content_base64, "base64")
+          : Buffer.from(options.content_text ?? "", "utf8");
+      if (buffer.byteLength > this.maxFileBytes) {
+        throw new ConfigError(
+          `content exceeds size cap (${String(buffer.byteLength)} > ${String(this.maxFileBytes)})`,
+        );
+      }
+      if (options.overwrite === false) {
+        try {
+          await fs.access(resolved);
+          throw new ConfigError(`file already exists and overwrite is disabled: ${resolved}`);
+        } catch (error: unknown) {
+          if (error instanceof ConfigError) {
+            throw error;
+          }
         }
       }
+      await fs.mkdir(path.dirname(resolved), { recursive: true });
+      await fs.writeFile(resolved, buffer);
+      const result = { path: resolved, bytes_transferred: buffer.byteLength };
+      this.logger.info(AgentEvent.FILE_WRITE, "host file write completed", {
+        path: result.path,
+        bytes_transferred: result.bytes_transferred,
+      });
+      return result;
+    } catch (error: unknown) {
+      this.logFileFailure(AgentEvent.FILE_WRITE, "host file write failed", filePath, error);
+      throw error;
     }
-    await fs.mkdir(path.dirname(resolved), { recursive: true });
-    await fs.writeFile(resolved, buffer);
-    return { path: resolved, bytes_transferred: buffer.byteLength };
   }
 
   public async delete(
     filePath: string,
     recursive = false,
   ): Promise<{ deleted: boolean; path: string }> {
-    const resolved = await this.resolveAllowedPath(filePath, { allowMissingLeaf: true });
     try {
-      await fs.rm(resolved, { recursive });
-      return { deleted: true, path: resolved };
-    } catch (error: unknown) {
-      if (isNotFoundError(error)) {
-        return { deleted: false, path: resolved };
+      const resolved = await this.resolveAllowedPath(filePath, { allowMissingLeaf: true });
+      try {
+        await fs.rm(resolved, { recursive });
+        const result = { deleted: true, path: resolved };
+        this.logger.info(AgentEvent.FILE_DELETE, "host file delete completed", result);
+        return result;
+      } catch (error: unknown) {
+        if (isNotFoundError(error)) {
+          const result = { deleted: false, path: resolved };
+          this.logger.info(AgentEvent.FILE_DELETE, "host file delete found nothing", result);
+          return result;
+        }
+        throw error;
       }
+    } catch (error: unknown) {
+      this.logFileFailure(AgentEvent.FILE_DELETE, "host file delete failed", filePath, error);
       throw error;
     }
   }
@@ -138,7 +172,10 @@ export class HostFileService {
       throw new ConfigError("no allowed roots configured for file operations");
     }
     const resolved = path.resolve(requestedPath);
-    const canonicalPath = await this.resolveCanonicalPath(resolved, options.allowMissingLeaf ?? false);
+    const canonicalPath = await this.resolveCanonicalPath(
+      resolved,
+      options.allowMissingLeaf ?? false,
+    );
     if (!(await this.isWithinAllowedRoots(canonicalPath))) {
       throw new ConfigError(`path is outside allowed roots: ${resolved}`);
     }
@@ -153,7 +190,10 @@ export class HostFileService {
     return await this.resolveCanonicalPath(path.resolve(root), true);
   }
 
-  private async resolveCanonicalPath(resolvedPath: string, allowMissingLeaf: boolean): Promise<string> {
+  private async resolveCanonicalPath(
+    resolvedPath: string,
+    allowMissingLeaf: boolean,
+  ): Promise<string> {
     if (!allowMissingLeaf) {
       return await fs.realpath(resolvedPath);
     }
@@ -181,7 +221,10 @@ export class HostFileService {
   private async isWithinAllowedRoots(canonicalPath: string): Promise<boolean> {
     for (const root of this.config.allowedRoots) {
       const canonicalRoot = await this.resolveCanonicalPath(path.resolve(root), true);
-      if (canonicalPath === canonicalRoot || canonicalPath.startsWith(`${canonicalRoot}${path.sep}`)) {
+      if (
+        canonicalPath === canonicalRoot ||
+        canonicalPath.startsWith(`${canonicalRoot}${path.sep}`)
+      ) {
         return true;
       }
     }
@@ -217,7 +260,33 @@ export class HostFileService {
       }
     }
   }
+
+  private logFileFailure(
+    event: string,
+    message: string,
+    requestedPath: string,
+    error: unknown,
+  ): void {
+    const errorMessage = toErrorMessage(error);
+    if (errorMessage.includes("outside allowed roots")) {
+      this.logger.error(AgentEvent.PATH_VIOLATION, "host file operation blocked by path policy", {
+        path: requestedPath,
+        error: errorMessage,
+        failure_class: "path_violation",
+      });
+      return;
+    }
+
+    this.logger.error(event, message, {
+      path: requestedPath,
+      error: errorMessage,
+      failure_class: "config",
+    });
+  }
 }
 
 const isNotFoundError = (error: unknown): boolean =>
   error instanceof Error && "code" in error && error.code === "ENOENT";
+
+const toErrorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : "unknown error";

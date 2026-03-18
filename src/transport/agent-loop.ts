@@ -6,6 +6,7 @@ import type { HostExecHandle, HostExecRequest } from "../host-control/types.ts";
 import type { HostFileService } from "../host-control/files.ts";
 import type { HostPtyService } from "../host-control/pty.ts";
 import type { HostServiceManager } from "../host-control/services.ts";
+import { AgentEvent, createNoopAgentLogger, type AgentLogger } from "../utils/logger.ts";
 
 export interface AgentLoopCredential {
   readonly token: string;
@@ -32,6 +33,7 @@ export interface NodeAgentLoopOptions {
   readonly reconnectDelayMs?: number;
   readonly maxReconnectDelayMs?: number;
   readonly heartbeatIntervalMs?: number;
+  readonly logger?: AgentLogger;
 }
 
 /** Purpose: Agent sessions track exec log history for get_logs support. */
@@ -50,6 +52,7 @@ export class NodeAgentLoop {
   private readonly reconnectDelayMs: number;
   private readonly maxReconnectDelayMs: number;
   private readonly heartbeatIntervalMs: number;
+  private readonly logger: AgentLogger;
 
   public constructor(private readonly options: NodeAgentLoopOptions) {
     this.webSocketFactory =
@@ -57,6 +60,7 @@ export class NodeAgentLoop {
     this.reconnectDelayMs = options.reconnectDelayMs ?? 100;
     this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? 1_000;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 5_000;
+    this.logger = options.logger ?? createNoopAgentLogger();
   }
 
   public async connectOnce(): Promise<void> {
@@ -66,7 +70,19 @@ export class NodeAgentLoop {
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
     let opened = false;
     let closedResolved = false;
+    let disconnectLogged = false;
     let resolveClosed: (() => void) | null = null;
+    const logDisconnect = (
+      level: "warn" | "error",
+      message: string,
+      details?: Record<string, unknown>,
+    ): void => {
+      if (disconnectLogged) {
+        return;
+      }
+      disconnectLogged = true;
+      this.logger[level](AgentEvent.DISCONNECT, message, details);
+    };
     const finishClosed = (): void => {
       if (heartbeatTimer !== null) {
         clearInterval(heartbeatTimer);
@@ -84,21 +100,41 @@ export class NodeAgentLoop {
       void this.handleIncomingFrame(socket, event.data);
     };
     socket.onclose = () => {
+      if (opened) {
+        logDisconnect("warn", "transport disconnected", {
+          control_plane_url: this.options.controlPlaneUrl,
+          failure_class: "transport",
+        });
+      }
       finishClosed();
     };
     await new Promise<void>((resolve, reject) => {
       socket.onopen = () => {
         opened = true;
+        this.logger.info(AgentEvent.CONNECT, "transport connected", {
+          control_plane_url: this.options.controlPlaneUrl,
+        });
         heartbeatTimer = setInterval(() => {
           socket.send(JSON.stringify({ type: "heartbeat", sent_at: new Date().toISOString() }));
         }, this.heartbeatIntervalMs);
         resolve();
       };
       socket.onerror = (event) => {
+        const errorMessage = toErrorMessage(event.error);
         if (!opened) {
+          this.logger.error(getConnectFailureEvent(errorMessage), "transport connection failed", {
+            control_plane_url: this.options.controlPlaneUrl,
+            error: errorMessage,
+            failure_class: "transport",
+          });
           reject(event.error instanceof Error ? event.error : new Error("websocket open failed"));
           return;
         }
+        logDisconnect("error", "transport errored after connect", {
+          control_plane_url: this.options.controlPlaneUrl,
+          error: errorMessage,
+          failure_class: "transport",
+        });
         finishClosed();
       };
     });
@@ -111,7 +147,12 @@ export class NodeAgentLoop {
       try {
         await this.connectOnce();
         delayMs = this.reconnectDelayMs;
-      } catch {
+      } catch (error: unknown) {
+        this.logger.warn(AgentEvent.RECONNECT, "transport reconnect scheduled", {
+          delay_ms: delayMs,
+          error: toErrorMessage(error),
+          failure_class: "transport",
+        });
         await sleep(delayMs);
         delayMs = Math.min(delayMs * 2, this.maxReconnectDelayMs);
       }
@@ -237,7 +278,11 @@ export class NodeAgentLoop {
     }
   }
 
-  private appendSessionLog(sessionId: string | undefined, stream: "stdout" | "stderr", message: string): void {
+  private appendSessionLog(
+    sessionId: string | undefined,
+    stream: "stdout" | "stderr",
+    message: string,
+  ): void {
     if (sessionId === undefined) {
       return;
     }
@@ -398,7 +443,7 @@ export class NodeAgentLoop {
     params: { path: string; encoding?: "text" | "base64" },
   ): Promise<RpcResult> {
     if (!this.options.fileService?.isEnabled()) {
-      return errorResult(requestId, "unsupported_capability", "file operations are not enabled");
+      return this.unsupportedCapability(requestId, "file_read", "file operations are not enabled");
     }
     try {
       const result = await this.options.fileService.read(params.path, params.encoding ?? "text");
@@ -426,7 +471,7 @@ export class NodeAgentLoop {
     params: { path: string; content_text?: string; content_base64?: string; overwrite?: boolean },
   ): Promise<RpcResult> {
     if (!this.options.fileService?.isEnabled()) {
-      return errorResult(requestId, "unsupported_capability", "file operations are not enabled");
+      return this.unsupportedCapability(requestId, "file_write", "file operations are not enabled");
     }
     try {
       const result = await this.options.fileService.write(params.path, {
@@ -453,7 +498,11 @@ export class NodeAgentLoop {
     params: { path: string; recursive?: boolean },
   ): Promise<RpcResult> {
     if (!this.options.fileService?.isEnabled()) {
-      return errorResult(requestId, "unsupported_capability", "file operations are not enabled");
+      return this.unsupportedCapability(
+        requestId,
+        "file_delete",
+        "file operations are not enabled",
+      );
     }
     try {
       const result = await this.options.fileService.delete(params.path, params.recursive ?? false);
@@ -476,7 +525,11 @@ export class NodeAgentLoop {
     params: { path?: string; recursive?: boolean },
   ): Promise<RpcResult> {
     if (!this.options.fileService?.isEnabled()) {
-      return errorResult(requestId, "unsupported_capability", "file operations are not enabled");
+      return this.unsupportedCapability(
+        requestId,
+        "file_browse",
+        "file operations are not enabled",
+      );
     }
     try {
       const entries = await this.options.fileService.browse(
@@ -511,7 +564,7 @@ export class NodeAgentLoop {
     },
   ): RpcResult {
     if (this.options.ptyService === undefined) {
-      return errorResult(requestId, "unsupported_capability", "PTY is not enabled");
+      return this.unsupportedCapability(requestId, "pty_open", "PTY is not enabled");
     }
     try {
       const session = this.options.ptyService.open({
@@ -544,7 +597,7 @@ export class NodeAgentLoop {
 
   private handlePtyInput(requestId: string, params: { pty_id: string; data: string }): RpcResult {
     if (this.options.ptyService === undefined) {
-      return errorResult(requestId, "unsupported_capability", "PTY is not enabled");
+      return this.unsupportedCapability(requestId, "pty_input", "PTY is not enabled");
     }
     const session = this.options.ptyService.get(params.pty_id);
     if (session === null) {
@@ -559,7 +612,7 @@ export class NodeAgentLoop {
     params: { pty_id: string; cols: number; rows: number },
   ): RpcResult {
     if (this.options.ptyService === undefined) {
-      return errorResult(requestId, "unsupported_capability", "PTY is not enabled");
+      return this.unsupportedCapability(requestId, "pty_resize", "PTY is not enabled");
     }
     const session = this.options.ptyService.get(params.pty_id);
     if (session === null) {
@@ -571,7 +624,7 @@ export class NodeAgentLoop {
 
   private handlePtyClose(requestId: string, params: { pty_id: string }): RpcResult {
     if (this.options.ptyService === undefined) {
-      return errorResult(requestId, "unsupported_capability", "PTY is not enabled");
+      return this.unsupportedCapability(requestId, "pty_close", "PTY is not enabled");
     }
     const session = this.options.ptyService.get(params.pty_id);
     if (session === null) {
@@ -593,7 +646,11 @@ export class NodeAgentLoop {
     },
   ): RpcResult {
     if (this.options.serviceManager === undefined) {
-      return errorResult(requestId, "unsupported_capability", "service launch is not enabled");
+      return this.unsupportedCapability(
+        requestId,
+        "service_launch",
+        "service launch is not enabled",
+      );
     }
     try {
       const service = this.options.serviceManager.launch({
@@ -625,7 +682,11 @@ export class NodeAgentLoop {
 
   private handleServiceStop(requestId: string, params: { service_id: string }): RpcResult {
     if (this.options.serviceManager === undefined) {
-      return errorResult(requestId, "unsupported_capability", "service management is not enabled");
+      return this.unsupportedCapability(
+        requestId,
+        "service_stop",
+        "service management is not enabled",
+      );
     }
     const stopped = this.options.serviceManager.stop(params.service_id);
     return okResult(requestId, {
@@ -633,6 +694,15 @@ export class NodeAgentLoop {
       artifacts: [],
       meta: { service_id: params.service_id, stopped },
     });
+  }
+
+  private unsupportedCapability(requestId: string, method: string, message: string): RpcResult {
+    this.logger.warn(AgentEvent.CAPABILITY_MISMATCH, "request blocked by disabled capability", {
+      method,
+      message,
+      failure_class: "capability_mismatch",
+    });
+    return errorResult(requestId, "unsupported_capability", message);
   }
 }
 
@@ -681,6 +751,12 @@ const toStringRecord = (value: unknown): Record<string, string> | undefined => {
 const sleep = async (ms: number): Promise<void> => {
   await new Promise((resolve) => setTimeout(resolve, ms));
 };
+
+const getConnectFailureEvent = (message: string): string =>
+  /auth|credential|401|403/i.test(message) ? AgentEvent.AUTH_FAIL : AgentEvent.CONNECT;
+
+const toErrorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : "unknown error";
 
 interface RpcResult {
   id: string;

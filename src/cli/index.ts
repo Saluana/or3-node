@@ -2,20 +2,30 @@ import { spawn } from "node:child_process";
 import { redeemBootstrapToken } from "../enroll/client.ts";
 import type { FetchLike } from "../enroll/client.ts";
 import { buildSignedManifest } from "../enroll/manifest.ts";
-import { ensureIdentity, resetIdentity } from "../identity/store.ts";
-import { loadConfig, loadState, saveConfig, saveState } from "../config/store.ts";
+import { ensureIdentity, loadIdentity, resetIdentity } from "../identity/store.ts";
+import {
+  clearBootstrapToken,
+  loadConfig,
+  loadState,
+  resetState,
+  saveConfig,
+  saveState,
+} from "../config/store.ts";
 import type { LaunchCommandOptions, NodeAgentConfig, NodeAgentState } from "../config/types.ts";
+import { resetHostExecHistory } from "../host-control/history.ts";
 import { HostControlService } from "../host-control/service.ts";
 import { collectAgentInfo, formatAgentInfo } from "../info/agent-info.ts";
 import { NodeAgentLoop } from "../transport/agent-loop.ts";
 import type { NodeAgentLoopOptions } from "../transport/agent-loop.ts";
-import { CliUsageError } from "../utils/errors.ts";
+import { CliUsageError, ConfigError } from "../utils/errors.ts";
+import { AgentEvent, createAgentLogger, type AgentLogger } from "../utils/logger.ts";
 
 export interface CliDependencies {
   readonly fetch?: FetchLike;
   readonly prompt?: (message: string) => string | null;
   readonly stdout?: Pick<typeof process.stdout, "write">;
   readonly stderr?: Pick<typeof process.stderr, "write">;
+  readonly logger?: AgentLogger;
   readonly launchSignal?: AbortSignal;
   readonly agentLoopFactory?: (options: NodeAgentLoopOptions) => AgentLoopLike;
   readonly backgroundLauncher?: (argv: readonly string[]) => Promise<void> | void;
@@ -33,9 +43,11 @@ export const runCli = async (
   const stderr = dependencies.stderr ?? process.stderr;
   const fetchImpl: FetchLike = dependencies.fetch ?? fetch;
   const promptImpl = dependencies.prompt ?? globalThis.prompt;
+  const logger = dependencies.logger ?? createAgentLogger(stderr);
+  const [command] = argv;
 
   try {
-    const [command, ...rest] = argv;
+    const [, ...rest] = argv;
     switch (command) {
       case undefined:
       case "--help":
@@ -43,20 +55,26 @@ export const runCli = async (
         stdout.write(renderHelp());
         return 0;
       case "launch":
-        return await handleLaunch(rest, dependencies, stdout, fetchImpl, promptImpl);
+        return await handleLaunch(rest, dependencies, stdout, fetchImpl, promptImpl, logger);
       case "doctor":
-        return await handleDoctor(stdout);
+        return await handleDoctor(stdout, logger);
       case "info":
-        return await handleInfo(stdout);
+        return await handleInfo(stdout, logger);
       case "status":
-        return await handleStatus(stdout);
+        return await handleStatus(stdout, logger);
       case "reset":
-        return await handleReset(stdout);
+        return await handleReset(stdout, logger);
       default:
         throw new CliUsageError(`unknown command: ${command}`);
     }
   } catch (error: unknown) {
-    stderr.write(`${toErrorMessage(error)}\n`);
+    if (error instanceof CliUsageError || error instanceof ConfigError) {
+      logger.error(AgentEvent.CONFIG_FAIL, "cli command failed", {
+        command: command ?? "help",
+        error: toErrorMessage(error),
+        failure_class: "config",
+      });
+    }
     return 1;
   }
 };
@@ -67,6 +85,7 @@ const handleLaunch = async (
   stdout: Pick<typeof process.stdout, "write">,
   fetchImpl: FetchLike,
   promptImpl: ((message: string) => string | null) | undefined,
+  logger: AgentLogger,
 ): Promise<number> => {
   const options = parseLaunchOptions(argv);
   const identity = await ensureIdentity();
@@ -77,12 +96,25 @@ const handleLaunch = async (
 
   let nextState = state;
   if (mergedConfig.bootstrapToken !== null && shouldRedeemBootstrap(nextState)) {
+    logger.info(AgentEvent.BOOTSTRAP_START, "redeeming bootstrap token", {
+      control_plane_url: mergedConfig.controlPlaneUrl,
+      manifest_node_id: manifest.node_id,
+      node_name: mergedConfig.nodeName,
+    });
     const redemption = await redeemBootstrapToken(
       mergedConfig.controlPlaneUrl,
       mergedConfig.bootstrapToken,
       manifest,
       fetchImpl,
-    );
+    ).catch((error: unknown) => {
+      logger.error(AgentEvent.BOOTSTRAP_FAIL, "bootstrap token redemption failed", {
+        control_plane_url: mergedConfig.controlPlaneUrl,
+        manifest_node_id: manifest.node_id,
+        error: toErrorMessage(error),
+        failure_class: "bootstrap",
+      });
+      throw error;
+    });
     nextState = {
       nodeId: redemption.node.manifest.node_id,
       enrolledAt: state.enrolledAt ?? new Date().toISOString(),
@@ -99,6 +131,23 @@ const handleLaunch = async (
             },
     };
     await saveState(nextState);
+    logger.info(AgentEvent.BOOTSTRAP_SUCCESS, "bootstrap token redeemed", {
+      node_id: nextState.nodeId,
+      approval_state: nextState.approvedAt === null ? "pending" : "approved",
+      failure_class: nextState.approvedAt === null ? "approval" : undefined,
+    });
+    if (nextState.approvedAt !== null) {
+      logger.info(AgentEvent.APPROVAL_RECEIVED, "node approval received", {
+        node_id: nextState.nodeId,
+        approved_at: nextState.approvedAt,
+      });
+    }
+    if (redemption.credential !== null) {
+      logger.info(AgentEvent.CREDENTIAL_REFRESHED, "runtime credential refreshed", {
+        node_id: nextState.nodeId,
+        expires_at: redemption.credential.expires_at,
+      });
+    }
   }
 
   stdout.write("or3-node launch\n");
@@ -112,14 +161,39 @@ const handleLaunch = async (
     return 0;
   }
 
-  stdout.write(`bootstrap: node status ${nextState.approvedAt === null ? "pending" : "approved"}\n`);
+  stdout.write(
+    `bootstrap: node status ${nextState.approvedAt === null ? "pending" : "approved"}\n`,
+  );
   if (nextState.approvedAt === null) {
+    logger.warn(AgentEvent.BOOTSTRAP_SUCCESS, "node is enrolled and waiting for approval", {
+      node_id: nextState.nodeId,
+      approval_state: "pending",
+      failure_class: "approval",
+    });
     stdout.write("agent loop: waiting for approval before connecting\n");
     stdout.write(`${renderNextStepLine(mergedConfig, nextState)}\n`);
     return 0;
   }
 
-  if (nextState.credential.token === null || nextState.credential.expiresAt === null) {
+  if (getCredentialState(nextState) !== "valid") {
+    logger.warn(AgentEvent.CREDENTIAL_EXPIRED, "runtime credential is not ready for launch", {
+      node_id: nextState.nodeId,
+      credential_state: getCredentialState(nextState),
+      expires_at: nextState.credential.expiresAt,
+      failure_class: "credential",
+    });
+    stdout.write("credential: missing or expired\n");
+    stdout.write(`${renderNextStepLine(mergedConfig, nextState)}\n`);
+    return 0;
+  }
+
+  const credentialToken = nextState.credential.token;
+  const credentialExpiresAt = nextState.credential.expiresAt;
+  if (credentialToken === null || credentialExpiresAt === null) {
+    logger.error(AgentEvent.CONFIG_FAIL, "launch reached an impossible credential state", {
+      node_id: nextState.nodeId,
+      failure_class: "credential",
+    });
     stdout.write("credential: missing or expired\n");
     stdout.write(`${renderNextStepLine(mergedConfig, nextState)}\n`);
     return 0;
@@ -130,13 +204,15 @@ const handleLaunch = async (
     const agentLoop = (dependencies.agentLoopFactory ?? defaultAgentLoopFactory)({
       controlPlaneUrl: mergedConfig.controlPlaneUrl,
       credential: {
-        token: nextState.credential.token,
-        expiresAt: nextState.credential.expiresAt,
+        token: credentialToken,
+        expiresAt: credentialExpiresAt,
       },
       hostControl: new HostControlService({
         allowedRoots: mergedConfig.allowedRoots,
         allowedEnvPassthrough: mergedConfig.allowedEnvNames,
+        logger,
       }),
+      logger,
     });
     await agentLoop.start(dependencies.launchSignal);
     stdout.write("agent loop: stopped\n");
@@ -153,42 +229,73 @@ const handleLaunch = async (
   return 0;
 };
 
-const handleDoctor = async (stdout: Pick<typeof process.stdout, "write">): Promise<number> => {
-  const [config, state, identity] = await Promise.all([
-    loadConfig(),
-    loadState(),
-    ensureIdentity(),
-  ]);
+const handleDoctor = async (
+  stdout: Pick<typeof process.stdout, "write">,
+  logger: AgentLogger,
+): Promise<number> => {
+  const [config, state, identity] = await Promise.all([loadConfig(), loadState(), loadIdentity()]);
+  logger.info(AgentEvent.INFO_COLLECT, "doctor collected local node status", {
+    enrollment: getEnrollmentState(state),
+    approval: getApprovalState(state),
+    credential: getCredentialState(state),
+  });
   stdout.write("or3-node doctor\n");
   stdout.write(`control plane url: ${config.controlPlaneUrl}\n`);
   stdout.write(`bootstrap token: ${config.bootstrapToken === null ? "missing" : "present"}\n`);
-  stdout.write(`identity: ${identity.publicKeyBase64.slice(0, 16)}…\n`);
-  stdout.write(`node id: ${state.nodeId ?? "not enrolled"}\n`);
-  stdout.write(`credential: ${state.credential.token === null ? "missing" : "present"}\n`);
+  stdout.write(
+    `identity: ${identity === null ? "missing" : `${identity.publicKeyBase64.slice(0, 16)}…`}\n`,
+  );
+  stdout.write(renderLifecycleStatusLines(state));
   stdout.write(`${renderNextStepLine(config, state)}\n`);
   return 0;
 };
 
-const handleInfo = async (stdout: Pick<typeof process.stdout, "write">): Promise<number> => {
-  const config = await loadConfig();
-  const info = collectAgentInfo(config);
-  stdout.write(formatAgentInfo(info));
-  return 0;
-};
-
-const handleStatus = async (stdout: Pick<typeof process.stdout, "write">): Promise<number> => {
+const handleInfo = async (
+  stdout: Pick<typeof process.stdout, "write">,
+  logger: AgentLogger,
+): Promise<number> => {
   const [config, state] = await Promise.all([loadConfig(), loadState()]);
+  const info = collectAgentInfo(config, getConnectionState());
+  logger.info(AgentEvent.INFO_COLLECT, "agent info collected", {
+    enrollment: getEnrollmentState(state),
+    approval: getApprovalState(state),
+    credential: getCredentialState(state),
+    connection: getConnectionState(),
+  });
+  stdout.write(formatAgentInfo(info));
+  stdout.write(renderLifecycleStatusLines(state));
+  return 0;
+};
+
+const handleStatus = async (
+  stdout: Pick<typeof process.stdout, "write">,
+  logger: AgentLogger,
+): Promise<number> => {
+  const [config, state] = await Promise.all([loadConfig(), loadState()]);
+  logger.info(AgentEvent.INFO_COLLECT, "status collected local node status", {
+    enrollment: getEnrollmentState(state),
+    approval: getApprovalState(state),
+    credential: getCredentialState(state),
+    connection: getConnectionState(),
+  });
   stdout.write("or3-node status\n");
-  stdout.write(`node id: ${state.nodeId ?? "not enrolled"}\n`);
-  stdout.write(`approved at: ${state.approvedAt ?? "pending"}\n`);
-  stdout.write(`credential expires at: ${state.credential.expiresAt ?? "unknown"}\n`);
+  stdout.write(renderLifecycleStatusLines(state));
   stdout.write(`${renderNextStepLine(config, state)}\n`);
   return 0;
 };
 
-const handleReset = async (stdout: Pick<typeof process.stdout, "write">): Promise<number> => {
-  await resetIdentity();
-  stdout.write("identity reset\n");
+const handleReset = async (
+  stdout: Pick<typeof process.stdout, "write">,
+  logger: AgentLogger,
+): Promise<number> => {
+  await Promise.all([resetIdentity(), resetState(), clearBootstrapToken(), resetHostExecHistory()]);
+  logger.info(AgentEvent.INFO_COLLECT, "local node state reset", {
+    cleared: ["identity", "state", "credentials", "bootstrap_token", "exec_history"],
+  });
+  stdout.write("local node state reset\n");
+  stdout.write(
+    "cleared: identity, enrollment state, runtime credentials, bootstrap token, exec history\n",
+  );
   return 0;
 };
 
@@ -349,19 +456,55 @@ const renderNextStepLine = (config: NodeAgentConfig, state: NodeAgentState): str
   if (state.approvedAt === null) {
     return 'next step: approve this node in or3-net, then run "or3-node launch --foreground"';
   }
-  if (state.credential.token === null || state.credential.expiresAt === null) {
+  if (getCredentialState(state) !== "valid") {
     return 'next step: run "or3-node launch" to refresh runtime credentials';
   }
   return 'next step: run "or3-node launch" to start the background agent, or use "--foreground" to keep it attached here';
 };
 
+const renderLifecycleStatusLines = (state: NodeAgentState): string =>
+  [
+    `enrollment:       ${getEnrollmentState(state)}`,
+    `approval:         ${getApprovalState(state)}`,
+    `credential:       ${getCredentialState(state)}`,
+    `connection:       ${getConnectionState()}`,
+    `node id:          ${state.nodeId ?? "not enrolled"}`,
+    `approved at:      ${state.approvedAt ?? "pending"}`,
+    `credential until: ${state.credential.expiresAt ?? "unknown"}`,
+  ].join("\n") + "\n";
+
+const getEnrollmentState = (state: NodeAgentState): "enrolled" | "not enrolled" =>
+  state.nodeId === null ? "not enrolled" : "enrolled";
+
+const getApprovalState = (state: NodeAgentState): "approved" | "pending" | "not enrolled" => {
+  if (state.nodeId === null) {
+    return "not enrolled";
+  }
+  return state.approvedAt === null ? "pending" : "approved";
+};
+
+const getCredentialState = (state: NodeAgentState): "missing" | "valid" | "expired" => {
+  if (state.credential.token === null || state.credential.expiresAt === null) {
+    return "missing";
+  }
+
+  return Date.parse(state.credential.expiresAt) <= Date.now() ? "expired" : "valid";
+};
+
+const getConnectionState = (): "connected" | "disconnected" | "unknown" => "unknown";
+
 const toErrorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : "unknown error";
 
 const shouldRedeemBootstrap = (state: Awaited<ReturnType<typeof loadState>>): boolean => {
-  if (state.credential.token === null || state.credential.expiresAt === null) {
+  if (getCredentialState(state) !== "valid") {
     return true;
   }
 
-  return new Date(state.credential.expiresAt).getTime() <= Date.now() + 5 * 60_000;
+  const expiresAt = state.credential.expiresAt;
+  if (expiresAt === null) {
+    return true;
+  }
+
+  return new Date(expiresAt).getTime() <= Date.now() + 5 * 60_000;
 };

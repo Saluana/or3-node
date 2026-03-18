@@ -4,6 +4,7 @@ import path from "node:path";
 import os from "node:os";
 
 import { HostFileService } from "../src/host-control/files.ts";
+import { createAgentLogger, type LogEntry } from "../src/utils/logger.ts";
 
 let tmpDir: string;
 let outsideDir: string;
@@ -27,6 +28,30 @@ const expectThrowsAsync = async (fn: () => Promise<unknown>, match: string): Pro
   }
 };
 
+const createLogWriter = (): {
+  readonly chunks: string[];
+  readonly writer: Pick<typeof process.stderr, "write">;
+} => {
+  const chunks: string[] = [];
+  return {
+    chunks,
+    writer: {
+      write: (chunk) => {
+        chunks.push(String(chunk));
+        return true;
+      },
+    },
+  };
+};
+
+const parseLogEntries = (chunks: readonly string[]): LogEntry[] =>
+  chunks
+    .join("")
+    .trim()
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line) as LogEntry);
+
 describe("HostFileService", () => {
   test("isEnabled returns true when allowed roots are configured", () => {
     const service = new HostFileService({ allowedRoots: [tmpDir] });
@@ -49,6 +74,22 @@ describe("HostFileService", () => {
     expect(read.content_text).toBe("hello world");
     expect(read.encoding).toBe("text");
     expect(read.size_bytes).toBe(11);
+  });
+
+  test("emits structured file operation logs", async () => {
+    const logs = createLogWriter();
+    const service = new HostFileService({
+      allowedRoots: [tmpDir],
+      logger: createAgentLogger(logs.writer),
+    });
+    const filePath = path.join(tmpDir, "logged.txt");
+
+    await service.write(filePath, { content_text: "logged" });
+    await service.read(filePath, "text");
+
+    const entries = parseLogEntries(logs.chunks);
+    expect(entries.some((entry) => entry.event === "file.write")).toBe(true);
+    expect(entries.some((entry) => entry.event === "file.read")).toBe(true);
   });
 
   test("write and read base64 file round-trip", async () => {
@@ -153,6 +194,23 @@ describe("HostFileService", () => {
       () => service.write("/tmp/evil.txt", { content_text: "bad" }),
       "outside allowed roots",
     );
+  });
+
+  test("logs file path violations clearly", async () => {
+    const logs = createLogWriter();
+    const service = new HostFileService({
+      allowedRoots: [tmpDir],
+      logger: createAgentLogger(logs.writer),
+    });
+
+    await expectThrowsAsync(
+      () => service.write("/tmp/evil.txt", { content_text: "bad" }),
+      "outside allowed roots",
+    );
+
+    const entries = parseLogEntries(logs.chunks);
+    expect(entries.some((entry) => entry.event === "path.violation")).toBe(true);
+    expect(entries.some((entry) => entry.details?.failure_class === "path_violation")).toBe(true);
   });
 
   test("rejects content exceeding size cap", async () => {

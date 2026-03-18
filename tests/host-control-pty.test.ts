@@ -1,6 +1,31 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import { HostPtyService } from "../src/host-control/pty.ts";
+import { createAgentLogger, type LogEntry } from "../src/utils/logger.ts";
+
+const createLogWriter = (): {
+  readonly chunks: string[];
+  readonly writer: Pick<typeof process.stderr, "write">;
+} => {
+  const chunks: string[] = [];
+  return {
+    chunks,
+    writer: {
+      write: (chunk) => {
+        chunks.push(String(chunk));
+        return true;
+      },
+    },
+  };
+};
+
+const parseLogEntries = (chunks: readonly string[]): LogEntry[] =>
+  chunks
+    .join("")
+    .trim()
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line) as LogEntry);
 
 describe("HostPtyService", () => {
   let service: HostPtyService;
@@ -122,5 +147,32 @@ describe("HostPtyService", () => {
     });
     expect(exitPtyId).toBe(session.ptyId);
     expect(exitCode).toBe(0);
+  });
+
+  test("emits structured PTY lifecycle logs", async () => {
+    const logs = createLogWriter();
+    let exitCode = -999;
+    service = new HostPtyService({
+      logger: createAgentLogger(logs.writer),
+      onExit: (_ptyId, code) => {
+        exitCode = code;
+      },
+    });
+    service.open({ sessionId: "sess_logs", command: "true" });
+
+    await new Promise<void>((resolve) => {
+      const check = (): void => {
+        if (exitCode !== -999) {
+          resolve();
+        } else {
+          setTimeout(check, 50);
+        }
+      };
+      setTimeout(check, 50);
+    });
+
+    const entries = parseLogEntries(logs.chunks);
+    expect(entries.some((entry) => entry.event === "pty.open")).toBe(true);
+    expect(entries.some((entry) => entry.event === "pty.exit")).toBe(true);
   });
 });

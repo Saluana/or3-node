@@ -71,6 +71,44 @@ The shipped CLI name stays short (`or3-node`) even though the planning docs may 
 - `https` remains available as a dev/fallback transport because it is simpler to debug and useful before a live socket is attached
 - tradeoff: `https` can exercise the same request contract, but it does not provide the same continuously attached session semantics as the connected `outbound-wss` path
 
+## Structured logs
+
+`or3-node` writes structured JSON logs to `stderr` for bootstrap, approval, credentials, transport, exec, PTY, and file-operation flows.
+
+Example success log:
+
+```json
+{
+  "level": "info",
+  "event": "transport.connect",
+  "message": "transport connected",
+  "timestamp": "2026-03-18T00:00:00.000Z",
+  "details": { "control_plane_url": "http://127.0.0.1:3001" }
+}
+```
+
+Example failure log:
+
+```json
+{
+  "level": "error",
+  "event": "path.violation",
+  "message": "host file operation blocked by path policy",
+  "timestamp": "2026-03-18T00:00:01.000Z",
+  "details": {
+    "path": "/tmp/outside.txt",
+    "error": "path is outside allowed roots: /tmp/outside.txt",
+    "failure_class": "path_violation"
+  }
+}
+```
+
+Useful fields:
+
+- `event`: stable lifecycle name like `bootstrap.start`, `credential.refreshed`, or `exec.finish`
+- `message`: short human-readable summary
+- `details.failure_class`: broad failure bucket such as `bootstrap`, `credential`, `transport`, `exec`, `capability_mismatch`, or `path_violation`
+
 ## Development
 
 Install dependencies:
