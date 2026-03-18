@@ -6,13 +6,16 @@ import os from "node:os";
 import { HostFileService } from "../src/host-control/files.ts";
 
 let tmpDir: string;
+let outsideDir: string;
 
 beforeEach(async () => {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "or3-files-test-"));
+  outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), "or3-files-outside-test-"));
 });
 
 afterEach(async () => {
   await fs.rm(tmpDir, { recursive: true, force: true });
+  await fs.rm(outsideDir, { recursive: true, force: true });
 });
 
 const expectThrowsAsync = async (fn: () => Promise<unknown>, match: string): Promise<void> => {
@@ -166,6 +169,27 @@ describe("HostFileService", () => {
     const filePath = path.join(tmpDir, "big.txt");
     await fs.writeFile(filePath, "a".repeat(100));
     await expectThrowsAsync(() => service.read(filePath), "exceeds size cap");
+  });
+
+  test("rejects reading through a symlink that escapes the allowed root", async () => {
+    const service = new HostFileService({ allowedRoots: [tmpDir] });
+    const outsideFile = path.join(outsideDir, "outside.txt");
+    const linkPath = path.join(tmpDir, "outside-link.txt");
+    await fs.writeFile(outsideFile, "secret");
+    await fs.symlink(outsideFile, linkPath);
+
+    await expectThrowsAsync(() => service.read(linkPath), "outside allowed roots");
+  });
+
+  test("rejects writing through a symlinked directory that escapes the allowed root", async () => {
+    const service = new HostFileService({ allowedRoots: [tmpDir] });
+    const linkDir = path.join(tmpDir, "linkdir");
+    await fs.symlink(outsideDir, linkDir);
+
+    await expectThrowsAsync(
+      () => service.write(path.join(linkDir, "escape.txt"), { content_text: "nope" }),
+      "outside allowed roots",
+    );
   });
 
   test("browse defaults to first allowed root when no path provided", async () => {

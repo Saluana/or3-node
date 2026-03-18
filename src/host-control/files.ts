@@ -54,7 +54,7 @@ export class HostFileService {
     filePath: string,
     encoding: "text" | "base64" = "text",
   ): Promise<FileReadResult> {
-    const resolved = this.resolveAllowedPath(filePath);
+    const resolved = await this.resolveAllowedPath(filePath);
     const stat = await fs.stat(resolved);
     if (!stat.isFile()) {
       throw new ConfigError(`not a file: ${resolved}`);
@@ -79,7 +79,7 @@ export class HostFileService {
     filePath: string,
     options: { content_text?: string; content_base64?: string; overwrite?: boolean },
   ): Promise<FileWriteResult> {
-    const resolved = this.resolveAllowedPath(filePath);
+    const resolved = await this.resolveAllowedPath(filePath, { allowMissingLeaf: true });
     const buffer =
       options.content_base64 !== undefined
         ? Buffer.from(options.content_base64, "base64")
@@ -108,53 +108,84 @@ export class HostFileService {
     filePath: string,
     recursive = false,
   ): Promise<{ deleted: boolean; path: string }> {
-    const resolved = this.resolveAllowedPath(filePath);
+    const resolved = await this.resolveAllowedPath(filePath, { allowMissingLeaf: true });
     try {
       await fs.rm(resolved, { recursive });
       return { deleted: true, path: resolved };
-    } catch {
-      return { deleted: false, path: resolved };
+    } catch (error: unknown) {
+      if (isNotFoundError(error)) {
+        return { deleted: false, path: resolved };
+      }
+      throw error;
     }
   }
 
   public async browse(dirPath?: string, recursive = false): Promise<FileEntry[]> {
     const resolved =
       dirPath !== undefined && dirPath !== ""
-        ? this.resolveAllowedPath(dirPath)
-        : this.resolveDefaultRoot();
+        ? await this.resolveAllowedPath(dirPath)
+        : await this.resolveDefaultRoot();
     const entries: FileEntry[] = [];
     await this.walkDir(resolved, entries, recursive ? 10 : 0, 0);
     return entries;
   }
 
-  private resolveAllowedPath(requestedPath: string): string {
+  private async resolveAllowedPath(
+    requestedPath: string,
+    options: { allowMissingLeaf?: boolean } = {},
+  ): Promise<string> {
     if (this.config.allowedRoots.length === 0) {
       throw new ConfigError("no allowed roots configured for file operations");
     }
     const resolved = path.resolve(requestedPath);
-    const normalizedResolved = path.normalize(resolved);
-    if (normalizedResolved !== resolved) {
-      throw new ConfigError(`path traversal detected: ${requestedPath}`);
-    }
-    const allowed = this.config.allowedRoots.some((root) => {
-      const resolvedRoot = path.resolve(root);
-      return (
-        normalizedResolved === resolvedRoot ||
-        normalizedResolved.startsWith(`${resolvedRoot}${path.sep}`)
-      );
-    });
-    if (!allowed) {
+    const canonicalPath = await this.resolveCanonicalPath(resolved, options.allowMissingLeaf ?? false);
+    if (!(await this.isWithinAllowedRoots(canonicalPath))) {
       throw new ConfigError(`path is outside allowed roots: ${resolved}`);
     }
     return resolved;
   }
 
-  private resolveDefaultRoot(): string {
+  private async resolveDefaultRoot(): Promise<string> {
     const root = this.config.allowedRoots[0];
     if (root === undefined) {
       throw new ConfigError("no allowed roots configured for file browsing");
     }
-    return path.resolve(root);
+    return await this.resolveCanonicalPath(path.resolve(root), true);
+  }
+
+  private async resolveCanonicalPath(resolvedPath: string, allowMissingLeaf: boolean): Promise<string> {
+    if (!allowMissingLeaf) {
+      return await fs.realpath(resolvedPath);
+    }
+
+    const missingSegments: string[] = [];
+    let currentPath = resolvedPath;
+    for (;;) {
+      try {
+        const canonicalExistingPath = await fs.realpath(currentPath);
+        return path.resolve(canonicalExistingPath, ...missingSegments.reverse());
+      } catch (error: unknown) {
+        if (!isNotFoundError(error)) {
+          throw error;
+        }
+        const parentPath = path.dirname(currentPath);
+        if (parentPath === currentPath) {
+          return resolvedPath;
+        }
+        missingSegments.push(path.basename(currentPath));
+        currentPath = parentPath;
+      }
+    }
+  }
+
+  private async isWithinAllowedRoots(canonicalPath: string): Promise<boolean> {
+    for (const root of this.config.allowedRoots) {
+      const canonicalRoot = await this.resolveCanonicalPath(path.resolve(root), true);
+      if (canonicalPath === canonicalRoot || canonicalPath.startsWith(`${canonicalRoot}${path.sep}`)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private async walkDir(
@@ -187,3 +218,6 @@ export class HostFileService {
     }
   }
 }
+
+const isNotFoundError = (error: unknown): boolean =>
+  error instanceof Error && "code" in error && error.code === "ENOENT";

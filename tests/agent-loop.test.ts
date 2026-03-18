@@ -39,6 +39,17 @@ class FailingOpenSocket extends FakeSocket {
   }
 }
 
+class ErrorAfterOpenSocket extends FakeSocket {
+  public constructor() {
+    super();
+    queueMicrotask(() => {
+      queueMicrotask(() => {
+        this.onerror?.({ error: new Error("socket failed after open") });
+      });
+    });
+  }
+}
+
 describe("node agent loop", () => {
   test("handles execute, heartbeat, and abort frames over a live socket", async () => {
     const socket = new FakeSocket();
@@ -52,6 +63,16 @@ describe("node agent loop", () => {
     });
 
     const run = loop.connectOnce();
+    socket.pushInbound(
+      JSON.stringify({
+        type: "request",
+        payload: {
+          id: "req-create-session",
+          method: "create_session",
+          params: { session_id: "sess_1", workspace_id: "ws_test" },
+        },
+      }),
+    );
     socket.pushInbound(
       JSON.stringify({
         type: "request",
@@ -81,8 +102,18 @@ describe("node agent loop", () => {
               required_capabilities: ["exec"],
             },
             subagent_policy: { enabled: false, max_depth: 0, max_jobs: 0 },
-            metadata: { command: "echo", args: ["hello"] },
+            metadata: { command: "echo", args: ["hello"], session_id: "sess_1" },
           },
+        },
+      }),
+    );
+    socket.pushInbound(
+      JSON.stringify({
+        type: "request",
+        payload: {
+          id: "req-logs",
+          method: "get_logs",
+          params: { session_id: "sess_1" },
         },
       }),
     );
@@ -103,6 +134,7 @@ describe("node agent loop", () => {
     expect(socket.outbound.some((payload) => payload.includes("req-heartbeat"))).toBeTrue();
     expect(socket.outbound.some((payload) => payload.includes("req-exec"))).toBeTrue();
     expect(socket.outbound.some((payload) => payload.includes("hello"))).toBeTrue();
+    expect(socket.outbound.some((payload) => payload.includes("req-logs"))).toBeTrue();
     expect(socket.outbound.some((payload) => payload.includes("req-abort"))).toBeTrue();
   });
 
@@ -135,5 +167,23 @@ describe("node agent loop", () => {
 
     expect(factoryCalls.length).toBeGreaterThanOrEqual(2);
     expect(openedSockets.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("connectOnce resolves when the socket errors after opening", async () => {
+    const loop = new NodeAgentLoop({
+      controlPlaneUrl: "http://or3.test",
+      credential: { token: "or3n_live", expiresAt: "2099-01-01T00:00:00.000Z" },
+      hostControl: new HostControlService(),
+      webSocketFactory: () => new ErrorAfterOpenSocket(),
+      reconnectDelayMs: 1,
+      maxReconnectDelayMs: 1,
+    });
+
+    await Promise.race([
+      loop.connectOnce(),
+      Bun.sleep(100).then(() => {
+        throw new Error("connectOnce timed out after socket error");
+      }),
+    ]);
   });
 });

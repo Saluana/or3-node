@@ -64,32 +64,42 @@ export class NodeAgentLoop {
       buildTransportUrl(this.options.controlPlaneUrl, this.options.credential.token),
     );
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    let opened = false;
+    let closedResolved = false;
+    let resolveClosed: (() => void) | null = null;
+    const finishClosed = (): void => {
+      if (heartbeatTimer !== null) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+      if (!closedResolved) {
+        closedResolved = true;
+        resolveClosed?.();
+      }
+    };
     const closed = new Promise<void>((resolve) => {
-      socket.onmessage = (event) => {
-        void this.handleIncomingFrame(socket, event.data);
-      };
-      socket.onclose = () => {
-        if (heartbeatTimer !== null) {
-          clearInterval(heartbeatTimer);
-        }
-        resolve();
-      };
-      socket.onerror = () => {
-        if (heartbeatTimer !== null) {
-          clearInterval(heartbeatTimer);
-        }
-        resolve();
-      };
+      resolveClosed = resolve;
     });
+    socket.onmessage = (event) => {
+      void this.handleIncomingFrame(socket, event.data);
+    };
+    socket.onclose = () => {
+      finishClosed();
+    };
     await new Promise<void>((resolve, reject) => {
       socket.onopen = () => {
+        opened = true;
         heartbeatTimer = setInterval(() => {
           socket.send(JSON.stringify({ type: "heartbeat", sent_at: new Date().toISOString() }));
         }, this.heartbeatIntervalMs);
         resolve();
       };
       socket.onerror = (event) => {
-        reject(event.error instanceof Error ? event.error : new Error("websocket open failed"));
+        if (!opened) {
+          reject(event.error instanceof Error ? event.error : new Error("websocket open failed"));
+          return;
+        }
+        finishClosed();
       };
     });
     await closed;
@@ -140,9 +150,11 @@ export class NodeAgentLoop {
       case "execute": {
         try {
           const hostRequest = toHostExecRequest(request.params);
+          const sessionId = getTaskPackageSessionId(request.params);
           const handle = await this.options.hostControl.exec({
             ...hostRequest,
             onStdout: (chunk): void => {
+              this.appendSessionLog(sessionId, "stdout", chunk);
               socket.send(
                 JSON.stringify({
                   type: "event",
@@ -152,6 +164,7 @@ export class NodeAgentLoop {
               );
             },
             onStderr: (chunk): void => {
+              this.appendSessionLog(sessionId, "stderr", chunk);
               socket.send(
                 JSON.stringify({
                   type: "event",
@@ -222,6 +235,21 @@ export class NodeAgentLoop {
       case "service_stop":
         return this.handleServiceStop(request.id, request.params);
     }
+  }
+
+  private appendSessionLog(sessionId: string | undefined, stream: "stdout" | "stderr", message: string): void {
+    if (sessionId === undefined) {
+      return;
+    }
+    const session = this.sessions.get(sessionId);
+    if (session === undefined) {
+      return;
+    }
+    session.logs.push({
+      stream,
+      message,
+      created_at: new Date().toISOString(),
+    });
   }
 
   private handleCreateSession(
@@ -632,6 +660,11 @@ const toHostExecRequest = (taskPackage: TaskPackage): HostExecRequest => {
     stdin,
     timeoutMs: taskPackage.timeout.hard_ms ?? taskPackage.timeout.soft_ms,
   };
+};
+
+const getTaskPackageSessionId = (taskPackage: TaskPackage): string | undefined => {
+  const sessionId = taskPackage.metadata.session_id;
+  return typeof sessionId === "string" && sessionId.length > 0 ? sessionId : undefined;
 };
 
 const toStringRecord = (value: unknown): Record<string, string> | undefined => {
