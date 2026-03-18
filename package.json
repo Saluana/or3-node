@@ -1,0 +1,30 @@
+{
+  "name": "or3-node",
+  "version": "0.1.0",
+  "private": true,
+  "bin": {
+    "or3-node": "./index.ts"
+  },
+  "type": "module",
+  "module": "index.ts",
+  "scripts": {
+    "lint": "bunx eslint . --max-warnings 0",
+    "typecheck": "bunx tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "or3-net": "file:../or3-net",
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/bun": "latest",
+    "eslint": "^9.22.0",
+    "eslint-import-resolver-typescript": "^4.4.4",
+    "eslint-plugin-import": "^2.32.0",
+    "typescript-eslint": "^8.57.0"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
