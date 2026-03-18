@@ -24,10 +24,10 @@ This plan was built by comparing the `or3-net` planning docs in `planning/node-a
 - Expose recent connection failures and last-known health directly in the CLI so support loops are faster.
 
 ## Day 1 — Make the main command trustworthy
-- [ ] Make `or3-node launch` actually start the agent loop after enrollment when the node has a valid credential.
-- [ ] Make `--foreground` do real work instead of being a no-op flag.
-- [ ] Update `doctor` and `status` copy so the next action is obvious when approval is still pending.
-- [ ] Add or update tests for launch behavior, pending approval, and credential-present startup flow.
+- [x] Make `or3-node launch` actually start the agent loop after enrollment when the node has a valid credential.
+- [x] Make `--foreground` do real work instead of being a no-op flag.
+- [x] Update `doctor` and `status` copy so the next action is obvious when approval is still pending.
+- [x] Add or update tests for launch behavior, pending approval, and credential-present startup flow.
 
 ## Day 2 — Fix the most visible paper cuts
 - [ ] Replace the hard-coded version in `src/info/agent-info.ts` with the package version.

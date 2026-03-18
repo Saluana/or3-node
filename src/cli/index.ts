@@ -1,10 +1,16 @@
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
 import { redeemBootstrapToken } from "../enroll/client.ts";
 import type { FetchLike } from "../enroll/client.ts";
 import { buildSignedManifest } from "../enroll/manifest.ts";
 import { ensureIdentity, resetIdentity } from "../identity/store.ts";
 import { loadConfig, loadState, saveConfig, saveState } from "../config/store.ts";
-import type { LaunchCommandOptions, NodeAgentConfig } from "../config/types.ts";
+import type { LaunchCommandOptions, NodeAgentConfig, NodeAgentState } from "../config/types.ts";
+import { HostControlService } from "../host-control/service.ts";
 import { collectAgentInfo, formatAgentInfo } from "../info/agent-info.ts";
+import { NodeAgentLoop } from "../transport/agent-loop.ts";
+import type { NodeAgentLoopOptions } from "../transport/agent-loop.ts";
 import { CliUsageError } from "../utils/errors.ts";
 
 export interface CliDependencies {
@@ -12,6 +18,13 @@ export interface CliDependencies {
   readonly prompt?: (message: string) => string | null;
   readonly stdout?: Pick<typeof process.stdout, "write">;
   readonly stderr?: Pick<typeof process.stderr, "write">;
+  readonly launchSignal?: AbortSignal;
+  readonly agentLoopFactory?: (options: NodeAgentLoopOptions) => AgentLoopLike;
+  readonly backgroundLauncher?: (argv: readonly string[]) => Promise<void> | void;
+}
+
+interface AgentLoopLike {
+  start(signal?: AbortSignal): Promise<void>;
 }
 
 export const runCli = async (
@@ -32,7 +45,7 @@ export const runCli = async (
         stdout.write(renderHelp());
         return 0;
       case "launch":
-        return await handleLaunch(rest, stdout, fetchImpl, promptImpl);
+        return await handleLaunch(rest, dependencies, stdout, fetchImpl, promptImpl);
       case "doctor":
         return await handleDoctor(stdout);
       case "info":
@@ -52,6 +65,7 @@ export const runCli = async (
 
 const handleLaunch = async (
   argv: readonly string[],
+  dependencies: CliDependencies,
   stdout: Pick<typeof process.stdout, "write">,
   fetchImpl: FetchLike,
   promptImpl: ((message: string) => string | null) | undefined,
@@ -93,14 +107,51 @@ const handleLaunch = async (
   stdout.write(`control plane: ${mergedConfig.controlPlaneUrl}\n`);
   stdout.write(`identity: ${identity.publicKeyBase64.slice(0, 16)}…\n`);
   stdout.write(`manifest node id: ${manifest.node_id}\n`);
+
   if (mergedConfig.bootstrapToken === null) {
     stdout.write("bootstrap: missing token; launch is configured but not enrolled yet\n");
-  } else {
-    stdout.write(
-      `bootstrap: node status ${nextState.approvedAt === null ? "pending" : "approved"}\n`,
-    );
+    stdout.write(`${renderNextStepLine(mergedConfig, nextState)}\n`);
+    return 0;
   }
-  stdout.write("agent loop: not yet started in this phase\n");
+
+  stdout.write(`bootstrap: node status ${nextState.approvedAt === null ? "pending" : "approved"}\n`);
+  if (nextState.approvedAt === null) {
+    stdout.write("agent loop: waiting for approval before connecting\n");
+    stdout.write(`${renderNextStepLine(mergedConfig, nextState)}\n`);
+    return 0;
+  }
+
+  if (nextState.credential.token === null || nextState.credential.expiresAt === null) {
+    stdout.write("credential: missing or expired\n");
+    stdout.write(`${renderNextStepLine(mergedConfig, nextState)}\n`);
+    return 0;
+  }
+
+  if (options.foreground) {
+    stdout.write("agent loop: starting in foreground\n");
+    const agentLoop = (dependencies.agentLoopFactory ?? defaultAgentLoopFactory)({
+      controlPlaneUrl: mergedConfig.controlPlaneUrl,
+      credential: {
+        token: nextState.credential.token,
+        expiresAt: nextState.credential.expiresAt,
+      },
+      hostControl: new HostControlService({
+        allowedRoots: mergedConfig.allowedRoots,
+        allowedEnvPassthrough: mergedConfig.allowedEnvNames,
+      }),
+    });
+    await agentLoop.start(dependencies.launchSignal);
+    stdout.write("agent loop: stopped\n");
+    return 0;
+  }
+
+  await (dependencies.backgroundLauncher ?? defaultBackgroundLauncher)([
+    "launch",
+    "--foreground",
+    "--no-interactive",
+  ]);
+  stdout.write("agent loop: started in background\n");
+  stdout.write(`${renderNextStepLine(mergedConfig, nextState)}\n`);
   return 0;
 };
 
@@ -116,6 +167,7 @@ const handleDoctor = async (stdout: Pick<typeof process.stdout, "write">): Promi
   stdout.write(`identity: ${identity.publicKeyBase64.slice(0, 16)}…\n`);
   stdout.write(`node id: ${state.nodeId ?? "not enrolled"}\n`);
   stdout.write(`credential: ${state.credential.token === null ? "missing" : "present"}\n`);
+  stdout.write(`${renderNextStepLine(config, state)}\n`);
   return 0;
 };
 
@@ -127,11 +179,12 @@ const handleInfo = async (stdout: Pick<typeof process.stdout, "write">): Promise
 };
 
 const handleStatus = async (stdout: Pick<typeof process.stdout, "write">): Promise<number> => {
-  const state = await loadState();
+  const [config, state] = await Promise.all([loadConfig(), loadState()]);
   stdout.write("or3-node status\n");
   stdout.write(`node id: ${state.nodeId ?? "not enrolled"}\n`);
   stdout.write(`approved at: ${state.approvedAt ?? "pending"}\n`);
   stdout.write(`credential expires at: ${state.credential.expiresAt ?? "unknown"}\n`);
+  stdout.write(`${renderNextStepLine(config, state)}\n`);
   return 0;
 };
 
@@ -237,6 +290,34 @@ const renderHelp = (): string =>
     "  reset",
     "",
   ].join("\n");
+
+const defaultAgentLoopFactory = (options: NodeAgentLoopOptions): AgentLoopLike =>
+  new NodeAgentLoop(options);
+
+const defaultBackgroundLauncher = (argv: readonly string[]): void => {
+  const entrypoint = process.argv[1] ?? fileURLToPath(new URL("../../index.ts", import.meta.url));
+  const child = spawn(process.execPath, [entrypoint, ...argv], {
+    detached: true,
+    stdio: "ignore",
+    env: { ...process.env },
+  });
+  child.unref();
+};
+
+const renderNextStepLine = (config: NodeAgentConfig, state: NodeAgentState): string => {
+  if (state.nodeId === null) {
+    return config.bootstrapToken === null
+      ? 'next step: run "or3-node launch --token <bootstrap-token>" to enroll this node'
+      : 'next step: run "or3-node launch" to continue enrollment with the saved bootstrap token';
+  }
+  if (state.approvedAt === null) {
+    return 'next step: approve this node in or3-net, then run "or3-node launch --foreground"';
+  }
+  if (state.credential.token === null || state.credential.expiresAt === null) {
+    return 'next step: run "or3-node launch" to refresh runtime credentials';
+  }
+  return 'next step: run "or3-node launch" to start the background agent, or use "--foreground" to keep it attached here';
+};
 
 const toErrorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : "unknown error";
