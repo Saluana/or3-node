@@ -199,8 +199,9 @@ describe("node agent loop", () => {
         });
         return socket;
       },
-      reconnectDelayMs: 1,
-      maxReconnectDelayMs: 2,
+      reconnectDelayMs: 10,
+      maxReconnectDelayMs: 20,
+      reconnectJitterRatio: 0,
     });
 
     await loop.start(controller.signal);
@@ -209,7 +210,71 @@ describe("node agent loop", () => {
     expect(openedSockets.length).toBeGreaterThanOrEqual(1);
     const entries = parseLogEntries(logs.chunks);
     expect(entries.some((entry) => entry.event === "transport.connect")).toBe(true);
-    expect(entries.some((entry) => entry.event === "transport.reconnect")).toBe(true);
+    expect(
+      entries.some(
+        (entry) =>
+          entry.event === "transport.reconnect" && entry.details?.delay_ms === 10,
+      ),
+    ).toBe(true);
+  });
+
+  test("applies jittered reconnect delay within the configured envelope", async () => {
+    const controller = new AbortController();
+    const logs = createLogWriter();
+    const randomValues = [1, 0];
+    let attempts = 0;
+    const loop = new NodeAgentLoop({
+      controlPlaneUrl: "http://or3.test",
+      credential: { token: "or3n_live", expiresAt: "2099-01-01T00:00:00.000Z" },
+      hostControl: new HostControlService(),
+      logger: createAgentLogger(logs.writer),
+      webSocketFactory: () => {
+        attempts += 1;
+        if (attempts >= 3) {
+          const socket = new FakeSocket();
+          queueMicrotask(() => {
+            socket.close();
+            controller.abort();
+          });
+          return socket;
+        }
+        return new FailingOpenSocket();
+      },
+      reconnectDelayMs: 10,
+      maxReconnectDelayMs: 20,
+      reconnectJitterRatio: 0.25,
+      random: () => randomValues.shift() ?? 0.5,
+    });
+
+    await loop.start(controller.signal);
+
+    const reconnectEntries = parseLogEntries(logs.chunks).filter(
+      (entry) => entry.event === "transport.reconnect",
+    );
+    expect(reconnectEntries).toHaveLength(2);
+    expect(reconnectEntries[0]?.details?.delay_ms).toBe(13);
+    expect(reconnectEntries[1]?.details?.delay_ms).toBe(15);
+  });
+
+  test("stops promptly when aborted during reconnect backoff", async () => {
+    const controller = new AbortController();
+    const loop = new NodeAgentLoop({
+      controlPlaneUrl: "http://or3.test",
+      credential: { token: "or3n_live", expiresAt: "2099-01-01T00:00:00.000Z" },
+      hostControl: new HostControlService(),
+      webSocketFactory: () => new FailingOpenSocket(),
+      reconnectDelayMs: 250,
+      maxReconnectDelayMs: 250,
+      reconnectJitterRatio: 0,
+    });
+
+    const startedAt = Date.now();
+    const run = loop.start(controller.signal);
+    await Bun.sleep(20);
+    controller.abort();
+    await run;
+
+    expect(Date.now() - startedAt).toBeLessThan(150);
   });
 
   test("connectOnce resolves when the socket errors after opening", async () => {
@@ -269,6 +334,223 @@ describe("node agent loop", () => {
         (entry) =>
           entry.event === "capability.mismatch" &&
           entry.details?.failure_class === "capability_mismatch",
+      ),
+    ).toBe(true);
+  });
+
+  test("retains bounded session logs with stable absolute cursors", async () => {
+    const socket = new FakeSocket();
+    const loop = new NodeAgentLoop({
+      controlPlaneUrl: "http://or3.test",
+      credential: { token: "or3n_live", expiresAt: "2099-01-01T00:00:00.000Z" },
+      hostControl: new HostControlService(),
+      webSocketFactory: () => socket,
+      reconnectDelayMs: 1,
+      maxReconnectDelayMs: 1,
+      sessionLogLimit: 3,
+    });
+
+    const run = loop.connectOnce();
+    socket.pushInbound(
+      JSON.stringify({
+        type: "request",
+        payload: {
+          id: "req-create-session",
+          method: "create_session",
+          params: { session_id: "sess_trim", workspace_id: "ws_test" },
+        },
+      }),
+    );
+    await Bun.sleep(10);
+
+    for (let index = 0; index < 5; index += 1) {
+      socket.pushInbound(
+        JSON.stringify({
+          type: "request",
+          payload: {
+            id: `req-session-exec-${String(index)}`,
+            method: "session_exec",
+            params: {
+              session_id: "sess_trim",
+              command: "python3",
+              args: ["-c", `print("line-${String(index)}")`],
+            },
+          },
+        }),
+      );
+      await Bun.sleep(20);
+    }
+    socket.pushInbound(
+      JSON.stringify({
+        type: "request",
+        payload: {
+          id: "req-get-logs",
+          method: "get_logs",
+          params: { session_id: "sess_trim" },
+        },
+      }),
+    );
+    await Bun.sleep(20);
+    socket.close();
+    await run;
+
+    const getLogsResponse = socket.outbound
+      .map((payload) => JSON.parse(payload) as { payload?: { id?: string; result?: { meta?: { chunks?: { cursor: string; message: string }[] } } } })
+      .find((frame) => frame.payload?.id === "req-get-logs");
+    const chunks = getLogsResponse?.payload?.result?.meta?.chunks ?? [];
+    expect(chunks).toHaveLength(3);
+    expect(chunks.map((chunk) => chunk.cursor)).toEqual(["3", "4", "5"]);
+    expect(chunks[0]?.message).toContain("line-2");
+  });
+
+  test("session exec surfaces truncation as system log and response metadata", async () => {
+    const socket = new FakeSocket();
+    const loop = new NodeAgentLoop({
+      controlPlaneUrl: "http://or3.test",
+      credential: { token: "or3n_live", expiresAt: "2099-01-01T00:00:00.000Z" },
+      hostControl: new HostControlService({ maxStdoutBytes: 24, maxConcurrentExecs: 1 }),
+      webSocketFactory: () => socket,
+      reconnectDelayMs: 1,
+      maxReconnectDelayMs: 1,
+      sessionLogLimit: 10,
+    });
+
+    const run = loop.connectOnce();
+    socket.pushInbound(
+      JSON.stringify({
+        type: "request",
+        payload: {
+          id: "req-create-session",
+          method: "create_session",
+          params: { session_id: "sess_trunc", workspace_id: "ws_test" },
+        },
+      }),
+    );
+    await Bun.sleep(10);
+    socket.pushInbound(
+      JSON.stringify({
+        type: "request",
+        payload: {
+          id: "req-session-trunc",
+          method: "session_exec",
+          params: {
+            session_id: "sess_trunc",
+            command: "python3",
+            args: ["-c", 'print("x" * 128)'],
+          },
+        },
+      }),
+    );
+    await Bun.sleep(50);
+    socket.pushInbound(
+      JSON.stringify({
+        type: "request",
+        payload: {
+          id: "req-get-logs-trunc",
+          method: "get_logs",
+          params: { session_id: "sess_trunc" },
+        },
+      }),
+    );
+    await Bun.sleep(20);
+    socket.close();
+    await run;
+
+    const frames = socket.outbound.map(
+      (payload) => JSON.parse(payload) as { payload?: { id?: string; result?: { meta?: Record<string, unknown> } } },
+    );
+    const execResponse = frames.find((frame) => frame.payload?.id === "req-session-trunc");
+    expect(execResponse?.payload?.result?.meta?.stdout_truncated).toBe(true);
+    expect(execResponse?.payload?.result?.meta?.truncation_warnings).toEqual([
+      "stdout output was truncated to the configured limit",
+    ]);
+
+    const getLogsResponse = frames.find((frame) => frame.payload?.id === "req-get-logs-trunc");
+    const chunks = (getLogsResponse?.payload?.result?.meta?.chunks ?? []) as {
+      stream: string;
+      message: string;
+    }[];
+    expect(chunks.some((chunk) => chunk.stream === "system")).toBe(true);
+    expect(chunks.some((chunk) => chunk.message.includes("output truncated"))).toBe(true);
+  });
+
+  test("clips oversized streamed output chunks before storing session logs", async () => {
+    const socket = new FakeSocket();
+    const loop = new NodeAgentLoop({
+      controlPlaneUrl: "http://or3.test",
+      credential: { token: "or3n_live", expiresAt: "2099-01-01T00:00:00.000Z" },
+      hostControl: new HostControlService({ maxStdoutBytes: 64 * 1024, maxConcurrentExecs: 1 }),
+      webSocketFactory: () => socket,
+      reconnectDelayMs: 1,
+      maxReconnectDelayMs: 1,
+      sessionLogLimit: 10,
+    });
+
+    const run = loop.connectOnce();
+    socket.pushInbound(
+      JSON.stringify({
+        type: "request",
+        payload: {
+          id: "req-create-session-big",
+          method: "create_session",
+          params: { session_id: "sess_big", workspace_id: "ws_test" },
+        },
+      }),
+    );
+    await Bun.sleep(10);
+    socket.pushInbound(
+      JSON.stringify({
+        type: "request",
+        payload: {
+          id: "req-session-big",
+          method: "session_exec",
+          params: {
+            session_id: "sess_big",
+            command: "python3",
+            args: ["-c", 'print("x" * 20000)'],
+          },
+        },
+      }),
+    );
+    await Bun.sleep(80);
+    socket.pushInbound(
+      JSON.stringify({
+        type: "request",
+        payload: {
+          id: "req-get-logs-big",
+          method: "get_logs",
+          params: { session_id: "sess_big" },
+        },
+      }),
+    );
+    await Bun.sleep(20);
+    socket.close();
+    await run;
+
+    const frames = socket.outbound.map((payload) => JSON.parse(payload) as {
+      type?: string;
+      request_id?: string;
+      payload?: { event?: string; data?: { text?: string }; id?: string; result?: { meta?: Record<string, unknown> } };
+    });
+    const outputEvents = frames.filter(
+      (frame) => frame.type === "event" && frame.request_id === "req-session-big",
+    );
+    expect(outputEvents.length).toBeGreaterThan(0);
+    expect(
+      Buffer.byteLength(outputEvents[0]?.payload?.data?.text ?? "", "utf8"),
+    ).toBeLessThanOrEqual(8 * 1024);
+
+    const getLogsResponse = frames.find((frame) => frame.payload?.id === "req-get-logs-big");
+    const chunks = (getLogsResponse?.payload?.result?.meta?.chunks ?? []) as {
+      stream: string;
+      message: string;
+    }[];
+    const stdoutChunk = chunks.find((chunk) => chunk.stream === "stdout");
+    expect(Buffer.byteLength(stdoutChunk?.message ?? "", "utf8")).toBeLessThanOrEqual(8 * 1024);
+    expect(
+      chunks.some(
+        (chunk) =>
+          chunk.stream === "system" && chunk.message.includes("session log transport limit"),
       ),
     ).toBe(true);
   });

@@ -159,7 +159,8 @@ export class HostControlService {
 
     let stdout = "";
     let stderr = "";
-    let truncationCount = 0;
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
     let timedOut = false;
 
     child.stdout.setEncoding("utf8");
@@ -167,13 +168,13 @@ export class HostControlService {
     child.stdout.on("data", (chunk: string) => {
       const next = appendBounded(stdout, chunk, this.config.maxStdoutBytes);
       stdout = next.value;
-      truncationCount += Number(next.truncated);
+      stdoutTruncated ||= next.truncated;
       input.onStdout?.(chunk);
     });
     child.stderr.on("data", (chunk: string) => {
       const next = appendBounded(stderr, chunk, this.config.maxStderrBytes);
       stderr = next.value;
-      truncationCount += Number(next.truncated);
+      stderrTruncated ||= next.truncated;
       input.onStderr?.(chunk);
     });
 
@@ -212,7 +213,9 @@ export class HostControlService {
           completedAt: new Date().toISOString(),
           exitCode: -1,
           signal: null,
-          truncated: truncationCount > 0,
+          truncated: stdoutTruncated || stderrTruncated,
+          stdoutTruncated,
+          stderrTruncated,
         };
         this.logger.error(AgentEvent.EXEC_FINISH, "host execution failed before exit", {
           exec_id: execId,
@@ -221,6 +224,8 @@ export class HostControlService {
           status: result.status,
           error: result.stderr,
           truncated: result.truncated,
+          stdout_truncated: result.stdoutTruncated,
+          stderr_truncated: result.stderrTruncated,
           failure_class: "exec",
         });
         this.completedExecs.set(execId, result);
@@ -256,7 +261,9 @@ export class HostControlService {
       completedAt: new Date().toISOString(),
       exitCode: terminal.code,
       signal: terminal.signal === "" ? null : (terminal.signal as NodeJS.Signals),
-      truncated: truncationCount > 0,
+      truncated: stdoutTruncated || stderrTruncated,
+      stdoutTruncated,
+      stderrTruncated,
     };
     this.completedExecs.set(execId, result);
     this.logExecResult(result);
@@ -293,6 +300,8 @@ export class HostControlService {
       exit_code: result.exitCode,
       signal: result.signal,
       truncated: result.truncated,
+      stdout_truncated: result.stdoutTruncated,
+      stderr_truncated: result.stderrTruncated,
     };
 
     switch (result.status) {
@@ -365,6 +374,8 @@ const toSnapshot = (result: HostExecResult): HostExecSnapshot => ({
   exitCode: result.exitCode,
   signal: result.signal,
   truncated: result.truncated,
+  stdoutTruncated: result.stdoutTruncated,
+  stderrTruncated: result.stderrTruncated,
 });
 
 const toErrorMessage = (error: unknown): string =>

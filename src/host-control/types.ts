@@ -24,6 +24,8 @@ export interface HostExecSnapshot {
   readonly exitCode: number | null;
   readonly signal: string | null;
   readonly truncated: boolean;
+  readonly stdoutTruncated: boolean;
+  readonly stderrTruncated: boolean;
 }
 
 export interface HostExecResult extends HostExecSnapshot {

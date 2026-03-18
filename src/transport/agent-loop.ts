@@ -33,17 +33,36 @@ export interface NodeAgentLoopOptions {
   readonly reconnectDelayMs?: number;
   readonly maxReconnectDelayMs?: number;
   readonly heartbeatIntervalMs?: number;
+  readonly reconnectJitterRatio?: number;
+  readonly random?: () => number;
+  readonly sessionLogLimit?: number;
   readonly logger?: AgentLogger;
 }
 
 /** Purpose: Agent sessions track exec log history for get_logs support. */
+type AgentSessionLogStream = "stdout" | "stderr" | "system";
+
+interface AgentSessionLogChunk {
+  readonly cursor: number;
+  readonly stream: AgentSessionLogStream;
+  readonly message: string;
+  readonly created_at: string;
+}
+
 interface AgentSession {
   readonly sessionId: string;
   readonly workspaceId: string;
   readonly createdAt: string;
-  readonly logs: { stream: string; message: string; created_at: string }[];
+  readonly logs: AgentSessionLogChunk[];
+  nextCursor: number;
   status: "ready" | "destroyed";
 }
+
+const DEFAULT_RECONNECT_DELAY_MS = 500;
+const DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000;
+const DEFAULT_RECONNECT_JITTER_RATIO = 0.25;
+const DEFAULT_SESSION_LOG_LIMIT = 256;
+const DEFAULT_SESSION_LOG_CHUNK_MAX_BYTES = 8 * 1024;
 
 export class NodeAgentLoop {
   private readonly activeExecs = new Map<string, HostExecHandle>();
@@ -52,14 +71,20 @@ export class NodeAgentLoop {
   private readonly reconnectDelayMs: number;
   private readonly maxReconnectDelayMs: number;
   private readonly heartbeatIntervalMs: number;
+  private readonly reconnectJitterRatio: number;
+  private readonly random: () => number;
+  private readonly sessionLogLimit: number;
   private readonly logger: AgentLogger;
 
   public constructor(private readonly options: NodeAgentLoopOptions) {
     this.webSocketFactory =
       options.webSocketFactory ?? ((url) => new WebSocket(url) as unknown as WebSocketLike);
-    this.reconnectDelayMs = options.reconnectDelayMs ?? 100;
-    this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? 1_000;
+    this.reconnectDelayMs = options.reconnectDelayMs ?? DEFAULT_RECONNECT_DELAY_MS;
+    this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? DEFAULT_MAX_RECONNECT_DELAY_MS;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 5_000;
+    this.reconnectJitterRatio = options.reconnectJitterRatio ?? DEFAULT_RECONNECT_JITTER_RATIO;
+    this.random = options.random ?? Math.random;
+    this.sessionLogLimit = options.sessionLogLimit ?? DEFAULT_SESSION_LOG_LIMIT;
     this.logger = options.logger ?? createNoopAgentLogger();
   }
 
@@ -148,12 +173,17 @@ export class NodeAgentLoop {
         await this.connectOnce();
         delayMs = this.reconnectDelayMs;
       } catch (error: unknown) {
+        if (signal?.aborted) {
+          break;
+        }
+        const scheduledDelayMs = applyJitter(delayMs, this.reconnectJitterRatio, this.random);
         this.logger.warn(AgentEvent.RECONNECT, "transport reconnect scheduled", {
-          delay_ms: delayMs,
+          delay_ms: scheduledDelayMs,
+          base_delay_ms: delayMs,
           error: toErrorMessage(error),
           failure_class: "transport",
         });
-        await sleep(delayMs);
+        await sleep(scheduledDelayMs, signal);
         delayMs = Math.min(delayMs * 2, this.maxReconnectDelayMs);
       }
     }
@@ -192,25 +222,44 @@ export class NodeAgentLoop {
         try {
           const hostRequest = toHostExecRequest(request.params);
           const sessionId = getTaskPackageSessionId(request.params);
+          let streamChunkClipWarningLogged = false;
           const handle = await this.options.hostControl.exec({
             ...hostRequest,
             onStdout: (chunk): void => {
-              this.appendSessionLog(sessionId, "stdout", chunk);
+              const outputChunk = clipSessionLogChunk(chunk);
+              this.appendSessionLog(sessionId, "stdout", outputChunk.text);
+              if (outputChunk.clipped && !streamChunkClipWarningLogged) {
+                streamChunkClipWarningLogged = true;
+                this.appendSessionLog(
+                  sessionId,
+                  "system",
+                  "output chunk clipped to the session log transport limit",
+                );
+              }
               socket.send(
                 JSON.stringify({
                   type: "event",
                   request_id: request.id,
-                  payload: { event: "output", data: { text: chunk } },
+                  payload: { event: "output", data: { text: outputChunk.text } },
                 }),
               );
             },
             onStderr: (chunk): void => {
-              this.appendSessionLog(sessionId, "stderr", chunk);
+              const outputChunk = clipSessionLogChunk(chunk);
+              this.appendSessionLog(sessionId, "stderr", outputChunk.text);
+              if (outputChunk.clipped && !streamChunkClipWarningLogged) {
+                streamChunkClipWarningLogged = true;
+                this.appendSessionLog(
+                  sessionId,
+                  "system",
+                  "output chunk clipped to the session log transport limit",
+                );
+              }
               socket.send(
                 JSON.stringify({
                   type: "event",
                   request_id: request.id,
-                  payload: { event: "output", data: { text: chunk } },
+                  payload: { event: "output", data: { text: outputChunk.text } },
                 }),
               );
             },
@@ -218,17 +267,13 @@ export class NodeAgentLoop {
           this.activeExecs.set(request.params.job_id, handle);
           const result = await handle.result;
           this.activeExecs.delete(request.params.job_id);
+          this.appendSessionTruncationWarning(sessionId, result);
           return {
             id: request.id,
             result: {
               output_text: result.stdout,
               artifacts: [],
-              meta: {
-                exit_code: result.exitCode,
-                stderr: result.stderr,
-                signal: result.signal,
-                status: result.status,
-              },
+              meta: toExecutionMeta(result),
             },
           };
         } catch (error: unknown) {
@@ -280,7 +325,7 @@ export class NodeAgentLoop {
 
   private appendSessionLog(
     sessionId: string | undefined,
-    stream: "stdout" | "stderr",
+    stream: AgentSessionLogStream,
     message: string,
   ): void {
     if (sessionId === undefined) {
@@ -291,10 +336,16 @@ export class NodeAgentLoop {
       return;
     }
     session.logs.push({
+      cursor: session.nextCursor,
       stream,
       message,
       created_at: new Date().toISOString(),
     });
+    session.nextCursor += 1;
+    const overflow = session.logs.length - this.sessionLogLimit;
+    if (overflow > 0) {
+      session.logs.splice(0, overflow);
+    }
   }
 
   private handleCreateSession(
@@ -309,6 +360,7 @@ export class NodeAgentLoop {
       workspaceId: params.workspace_id,
       createdAt: new Date().toISOString(),
       logs: [],
+      nextCursor: 1,
       status: "ready",
     };
     this.sessions.set(params.session_id, session);
@@ -356,6 +408,7 @@ export class NodeAgentLoop {
     }
     try {
       const argv = [params.command, ...(params.args ?? [])];
+      let streamChunkClipWarningLogged = false;
       const handle = await this.options.hostControl.exec({
         argv,
         cwd: params.cwd,
@@ -363,44 +416,50 @@ export class NodeAgentLoop {
         stdin: params.stdin,
         timeoutMs: params.timeout_ms,
         onStdout: (chunk): void => {
-          session.logs.push({
-            stream: "stdout",
-            message: chunk,
-            created_at: new Date().toISOString(),
-          });
+          const outputChunk = clipSessionLogChunk(chunk);
+          this.appendSessionLog(params.session_id, "stdout", outputChunk.text);
+          if (outputChunk.clipped && !streamChunkClipWarningLogged) {
+            streamChunkClipWarningLogged = true;
+            this.appendSessionLog(
+              params.session_id,
+              "system",
+              "output chunk clipped to the session log transport limit",
+            );
+          }
           socket.send(
             JSON.stringify({
               type: "event",
               request_id: requestId,
-              payload: { event: "output", data: { text: chunk } },
+              payload: { event: "output", data: { text: outputChunk.text } },
             }),
           );
         },
         onStderr: (chunk): void => {
-          session.logs.push({
-            stream: "stderr",
-            message: chunk,
-            created_at: new Date().toISOString(),
-          });
+          const outputChunk = clipSessionLogChunk(chunk);
+          this.appendSessionLog(params.session_id, "stderr", outputChunk.text);
+          if (outputChunk.clipped && !streamChunkClipWarningLogged) {
+            streamChunkClipWarningLogged = true;
+            this.appendSessionLog(
+              params.session_id,
+              "system",
+              "output chunk clipped to the session log transport limit",
+            );
+          }
           socket.send(
             JSON.stringify({
               type: "event",
               request_id: requestId,
-              payload: { event: "output", data: { text: chunk } },
+              payload: { event: "output", data: { text: outputChunk.text } },
             }),
           );
         },
       });
       const result = await handle.result;
+      this.appendSessionTruncationWarning(params.session_id, result);
       return okResult(requestId, {
         output_text: result.stdout,
         artifacts: [],
-        meta: {
-          exit_code: result.exitCode,
-          stderr: result.stderr,
-          signal: result.signal,
-          status: result.status,
-        },
+        meta: toExecutionMeta(result),
       });
     } catch (error: unknown) {
       return errorResult(
@@ -419,17 +478,21 @@ export class NodeAgentLoop {
     if (session === undefined) {
       return errorResult(requestId, "session_not_found", `session ${params.session_id} not found`);
     }
-    const cursorIndex = params.cursor !== undefined ? parseInt(params.cursor, 10) : 0;
+    const cursorIndex = parseLogCursor(params.cursor);
     const limit = params.limit ?? 100;
-    const chunks = session.logs.slice(cursorIndex, cursorIndex + limit).map((log, index) => ({
+    const chunks = session.logs
+      .filter((log) => log.cursor > cursorIndex)
+      .slice(0, limit)
+      .map((log) => ({
       stream: log.stream,
       message: log.message,
-      cursor: String(cursorIndex + index + 1),
+      cursor: String(log.cursor),
       created_at: log.created_at,
-    }));
+      }));
+    const lastReturnedCursor = chunks.at(-1)?.cursor;
     const nextCursor =
-      cursorIndex + chunks.length < session.logs.length
-        ? String(cursorIndex + chunks.length)
+      lastReturnedCursor !== undefined && session.logs.some((log) => log.cursor > Number(lastReturnedCursor))
+        ? lastReturnedCursor
         : undefined;
     return okResult(requestId, {
       output_text: JSON.stringify({ chunks, next_cursor: nextCursor }),
@@ -704,6 +767,22 @@ export class NodeAgentLoop {
     });
     return errorResult(requestId, "unsupported_capability", message);
   }
+
+  private appendSessionTruncationWarning(
+    sessionId: string | undefined,
+    result: Awaited<HostExecHandle["result"]>,
+  ): void {
+    if (sessionId === undefined || !result.truncated) {
+      return;
+    }
+
+    const warning = buildTruncationWarningMessage(result);
+    if (warning === null) {
+      return;
+    }
+
+    this.appendSessionLog(sessionId, "system", warning);
+  }
 }
 
 const buildTransportUrl = (baseUrl: string, token: string): string => {
@@ -748,15 +827,114 @@ const toStringRecord = (value: unknown): Record<string, string> | undefined => {
   return entries.length === 0 ? undefined : Object.fromEntries(entries);
 };
 
-const sleep = async (ms: number): Promise<void> => {
-  await new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = async (ms: number, signal?: AbortSignal): Promise<void> => {
+  await new Promise<void>((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    }, ms);
+
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+
+    signal?.addEventListener("abort", finish, { once: true });
+  });
 };
+
+const clipSessionLogChunk = (message: string): { text: string; clipped: boolean } => {
+  const encoded = Buffer.from(message, "utf8");
+  if (encoded.byteLength <= DEFAULT_SESSION_LOG_CHUNK_MAX_BYTES) {
+    return { text: message, clipped: false };
+  }
+
+  return {
+    text: encoded.subarray(0, DEFAULT_SESSION_LOG_CHUNK_MAX_BYTES).toString("utf8"),
+    clipped: true,
+  };
+};
+
+const applyJitter = (delayMs: number, jitterRatio: number, random: () => number): number => {
+  if (delayMs <= 0 || jitterRatio <= 0) {
+    return delayMs;
+  }
+
+  const spread = delayMs * jitterRatio;
+  const minDelay = Math.max(0, delayMs - spread);
+  const maxDelay = delayMs + spread;
+  const jittered = minDelay + (maxDelay - minDelay) * random();
+  return Math.max(1, Math.round(jittered));
+};
+
+const parseLogCursor = (cursor: string | undefined): number => {
+  if (cursor === undefined) {
+    return 0;
+  }
+
+  const parsed = Number.parseInt(cursor, 10);
+  if (Number.isNaN(parsed) || parsed < 0) {
+    return 0;
+  }
+
+  return parsed;
+};
+
+const buildTruncationWarnings = (
+  result: Pick<HostExecRequestResultLike, "stdoutTruncated" | "stderrTruncated">,
+): string[] => {
+  const warnings: string[] = [];
+  if (result.stdoutTruncated) {
+    warnings.push("stdout output was truncated to the configured limit");
+  }
+  if (result.stderrTruncated) {
+    warnings.push("stderr output was truncated to the configured limit");
+  }
+  return warnings;
+};
+
+const buildTruncationWarningMessage = (
+  result: Pick<HostExecRequestResultLike, "stdoutTruncated" | "stderrTruncated">,
+): string | null => {
+  const warnings = buildTruncationWarnings(result);
+  if (warnings.length === 0) {
+    return null;
+  }
+  return `output truncated: ${warnings.join("; ")}`;
+};
+
+const toExecutionMeta = (result: HostExecRequestResultLike): Record<string, unknown> => ({
+  exit_code: result.exitCode,
+  stderr: result.stderr,
+  signal: result.signal,
+  status: result.status,
+  truncated: result.truncated,
+  stdout_truncated: result.stdoutTruncated,
+  stderr_truncated: result.stderrTruncated,
+  truncation_warnings: buildTruncationWarnings(result),
+});
 
 const getConnectFailureEvent = (message: string): string =>
   /auth|credential|401|403/i.test(message) ? AgentEvent.AUTH_FAIL : AgentEvent.CONNECT;
 
 const toErrorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : "unknown error";
+
+interface HostExecRequestResultLike {
+  readonly exitCode: number | null;
+  readonly stderr: string;
+  readonly signal: string | null;
+  readonly status: string;
+  readonly truncated: boolean;
+  readonly stdoutTruncated: boolean;
+  readonly stderrTruncated: boolean;
+}
 
 interface RpcResult {
   id: string;

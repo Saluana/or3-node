@@ -49,10 +49,10 @@ This plan was built by comparing the `or3-net` planning docs in `planning/node-a
 
 ## Day 4 — Reduce connection and memory risk
 
-- [ ] Add jittered reconnect backoff, closer to the planning recommendation of starting slower and backing off longer.
-- [ ] Add bounded retention for in-memory session logs in `src/transport/agent-loop.ts`.
-- [ ] Surface truncation warnings when stdout or stderr is capped so users know results are partial.
-- [ ] Add focused tests for reconnect behavior, truncation signaling, and session-log retention.
+ [x] Add jittered reconnect backoff, closer to the planning recommendation of starting slower and backing off longer.
+ [x] Add bounded retention for in-memory session logs in `src/transport/agent-loop.ts`.
+ [x] Surface truncation warnings when stdout or stderr is capped so users know results are partial.
+ [x] Add focused tests for reconnect behavior, truncation signaling, and session-log retention.
 
 ## Day 5 — Tighten feature truthfulness and capability reporting
 
