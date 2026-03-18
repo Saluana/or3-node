@@ -1,6 +1,4 @@
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
-
 import { redeemBootstrapToken } from "../enroll/client.ts";
 import type { FetchLike } from "../enroll/client.ts";
 import { buildSignedManifest } from "../enroll/manifest.ts";
@@ -295,14 +293,52 @@ const defaultAgentLoopFactory = (options: NodeAgentLoopOptions): AgentLoopLike =
   new NodeAgentLoop(options);
 
 const defaultBackgroundLauncher = (argv: readonly string[]): void => {
-  const entrypoint = process.argv[1] ?? fileURLToPath(new URL("../../index.ts", import.meta.url));
+  const entrypoint = process.argv[1];
+  if (entrypoint === undefined) {
+    throw new Error(
+      "unable to determine the or3-node entrypoint for background launch; ensure or3-node was launched with a valid script path",
+    );
+  }
   const child = spawn(process.execPath, [entrypoint, ...argv], {
     detached: true,
     stdio: "ignore",
-    env: { ...process.env },
+    env: buildBackgroundLaunchEnv(),
   });
   child.unref();
 };
+
+const buildBackgroundLaunchEnv = (): NodeJS.ProcessEnv =>
+  Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([name, value]) =>
+        value !== undefined &&
+        (BACKGROUND_ENV_NAMES.has(name) || name.startsWith("BUN_") || name.startsWith("OR3_NODE_")),
+    ),
+  );
+
+const BACKGROUND_ENV_NAMES = new Set([
+  "APPDATA",
+  "ComSpec",
+  "HOME",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "LOCALAPPDATA",
+  "NO_PROXY",
+  "NODE_EXTRA_CA_CERTS",
+  "PATH",
+  "SSL_CERT_DIR",
+  "SSL_CERT_FILE",
+  "SystemRoot",
+  "TEMP",
+  "TMP",
+  "TMPDIR",
+  "USERPROFILE",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_RUNTIME_DIR",
+]);
 
 const renderNextStepLine = (config: NodeAgentConfig, state: NodeAgentState): string => {
   if (state.nodeId === null) {
