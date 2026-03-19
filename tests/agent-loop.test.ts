@@ -28,6 +28,17 @@ const parseLogEntries = (chunks: readonly string[]): LogEntry[] =>
     .filter((line) => line.length > 0)
     .map((line) => JSON.parse(line) as LogEntry);
 
+type SocketFrame = {
+  type?: string;
+  request_id?: string;
+  payload?: {
+    event?: string;
+    data?: { text?: string };
+    id?: string;
+    result?: { meta?: Record<string, unknown> };
+  };
+};
+
 class FakeSocket {
   public onopen: (() => void) | null = null;
   public onmessage: ((event: { readonly data: string }) => void) | null = null;
@@ -588,11 +599,7 @@ describe("node agent loop", () => {
     socket.close();
     await run;
 
-    const frames = socket.outbound.map((payload) => JSON.parse(payload) as {
-      type?: string;
-      request_id?: string;
-      payload?: { event?: string; data?: { text?: string }; id?: string; result?: { meta?: Record<string, unknown> } };
-    });
+    const frames = socket.outbound.map((payload) => JSON.parse(payload) as SocketFrame);
     const outputEvents = frames.filter(
       (frame) => frame.type === "event" && frame.request_id === "req-session-big",
     );

@@ -258,7 +258,6 @@ export class HostFileService {
           this.logger.warn(AgentEvent.FILE_BROWSE, "host file browse entry metadata unavailable", {
             path: fullPath,
             error: toErrorMessage(error),
-            failure_class: "config",
           });
           entries.push({ path: fullPath, kind: "file" });
         }
