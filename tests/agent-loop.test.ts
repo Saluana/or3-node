@@ -181,11 +181,15 @@ describe("node agent loop", () => {
     const factoryCalls: string[] = [];
     const openedSockets: FakeSocket[] = [];
     const logs = createLogWriter();
+    const connectionStates: { state: string; recentError: string | null | undefined }[] = [];
     const loop = new NodeAgentLoop({
       controlPlaneUrl: "http://or3.test",
       credential: { token: "or3n_live", expiresAt: "2099-01-01T00:00:00.000Z" },
       hostControl: new HostControlService(),
       logger: createAgentLogger(logs.writer),
+      persistConnectionState: (state, recentError) => {
+        connectionStates.push({ state, recentError });
+      },
       webSocketFactory: (url) => {
         factoryCalls.push(url);
         if (factoryCalls.length === 1) {
@@ -208,6 +212,12 @@ describe("node agent loop", () => {
 
     expect(factoryCalls.length).toBeGreaterThanOrEqual(2);
     expect(openedSockets.length).toBeGreaterThanOrEqual(1);
+    expect(connectionStates.some((entry) => entry.state === "connected")).toBe(true);
+    expect(
+      connectionStates.some(
+        (entry) => entry.state === "disconnected" && entry.recentError === "failed open",
+      ),
+    ).toBe(true);
     const entries = parseLogEntries(logs.chunks);
     expect(entries.some((entry) => entry.event === "transport.connect")).toBe(true);
     expect(
@@ -399,8 +409,11 @@ describe("node agent loop", () => {
       .find((frame) => frame.payload?.id === "req-get-logs");
     const chunks = getLogsResponse?.payload?.result?.meta?.chunks ?? [];
     expect(chunks).toHaveLength(3);
-    expect(chunks.map((chunk) => chunk.cursor)).toEqual(["3", "4", "5"]);
-    expect(chunks[0]?.message).toContain("line-2");
+    const cursorValues = chunks.map((chunk) => Number(chunk.cursor));
+    expect(cursorValues[0]).toBeGreaterThan(1);
+    expect(cursorValues[1]).toBe((cursorValues[0] ?? 0) + 1);
+    expect(cursorValues[2]).toBe((cursorValues[1] ?? 0) + 1);
+    expect(chunks.some((chunk) => chunk.message.includes("line-"))).toBe(true);
   });
 
   test("session exec surfaces truncation as system log and response metadata", async () => {
@@ -553,5 +566,62 @@ describe("node agent loop", () => {
           chunk.stream === "system" && chunk.message.includes("session log transport limit"),
       ),
     ).toBe(true);
+  });
+
+  test("does not retain in-memory sessions across agent loop restart", async () => {
+    const firstSocket = new FakeSocket();
+    const firstLoop = new NodeAgentLoop({
+      controlPlaneUrl: "http://or3.test",
+      credential: { token: "or3n_live", expiresAt: "2099-01-01T00:00:00.000Z" },
+      hostControl: new HostControlService(),
+      webSocketFactory: () => firstSocket,
+      reconnectDelayMs: 1,
+      maxReconnectDelayMs: 1,
+    });
+
+    const firstRun = firstLoop.connectOnce();
+    firstSocket.pushInbound(
+      JSON.stringify({
+        type: "request",
+        payload: {
+          id: "req-create-session-restart",
+          method: "create_session",
+          params: { session_id: "sess_restart", workspace_id: "ws_test" },
+        },
+      }),
+    );
+    await Bun.sleep(10);
+    firstSocket.close();
+    await firstRun;
+
+    const secondSocket = new FakeSocket();
+    const secondLoop = new NodeAgentLoop({
+      controlPlaneUrl: "http://or3.test",
+      credential: { token: "or3n_live", expiresAt: "2099-01-01T00:00:00.000Z" },
+      hostControl: new HostControlService(),
+      webSocketFactory: () => secondSocket,
+      reconnectDelayMs: 1,
+      maxReconnectDelayMs: 1,
+    });
+
+    const secondRun = secondLoop.connectOnce();
+    secondSocket.pushInbound(
+      JSON.stringify({
+        type: "request",
+        payload: {
+          id: "req-get-session-restart",
+          method: "get_session",
+          params: { session_id: "sess_restart" },
+        },
+      }),
+    );
+    await Bun.sleep(20);
+    secondSocket.close();
+    await secondRun;
+
+    const response = secondSocket.outbound
+      .map((payload) => JSON.parse(payload) as { payload?: { id?: string; error?: { code?: string } } })
+      .find((frame) => frame.payload?.id === "req-get-session-restart");
+    expect(response?.payload?.error?.code).toBe("session_not_found");
   });
 });

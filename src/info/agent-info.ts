@@ -7,15 +7,11 @@
  * and for embedding in heartbeat/handshake metadata.
  */
 import os from "node:os";
-import { createRequire } from "node:module";
 
 import type { NodeAgentConfig } from "../config/types.ts";
-
-const require = createRequire(import.meta.url);
-
-const packageMetadata = require("../../package.json") as { version?: string };
-
-const AGENT_VERSION = packageMetadata.version ?? "0.0.0";
+import type { AgentConnectionState } from "./connection-state.ts";
+import { getAdvertisedCapabilityList } from "../runtime-capabilities.ts";
+import { AGENT_VERSION } from "../version.ts";
 
 export interface AgentInfo {
   readonly version: string;
@@ -27,7 +23,7 @@ export interface AgentInfo {
   readonly memory_free_mb: number;
   readonly cpu_cores: number;
   readonly capabilities: readonly string[];
-  readonly connection_state: "connected" | "disconnected" | "unknown";
+  readonly connection_state: AgentConnectionState;
   readonly recent_error: string | null;
 }
 
@@ -40,17 +36,10 @@ export interface AgentHealthReport {
 /** Purpose: Collects system and agent info for reporting. */
 export const collectAgentInfo = (
   config: Pick<NodeAgentConfig, "allowedRoots">,
-  connectionState: "connected" | "disconnected" | "unknown" = "unknown",
+  connectionState: AgentConnectionState = "unknown",
   recentError: string | null = null,
 ): AgentInfo => {
-  const capabilities: string[] = ["exec"];
-  if (config.allowedRoots.length > 0) {
-    capabilities.push("file-read", "file-write");
-  }
-  if (isPtySupported()) {
-    capabilities.push("pty");
-  }
-  capabilities.push("service-launch");
+  const capabilities = getAdvertisedCapabilityList(config);
 
   return {
     version: AGENT_VERSION,
@@ -69,7 +58,7 @@ export const collectAgentInfo = (
 
 /** Purpose: Produces a quick health assessment. */
 export const collectAgentHealth = (
-  connectionState: "connected" | "disconnected" | "unknown",
+  connectionState: AgentConnectionState,
   recentError: string | null = null,
 ): AgentHealthReport => {
   let status: AgentHealthReport["status"] = "healthy";
@@ -122,4 +111,3 @@ const formatDuration = (seconds: number): string => {
   return `${String(hours)}h ${String(minutes)}m`;
 };
 
-const isPtySupported = (): boolean => process.platform === "linux" || process.platform === "darwin";

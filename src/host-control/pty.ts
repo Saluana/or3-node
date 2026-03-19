@@ -33,7 +33,6 @@ export interface PtySession {
 
 export interface HostPtyServiceConfig {
   readonly maxConcurrentPtys?: number;
-  readonly allowedRoots?: readonly string[];
   readonly onOutput?: (ptyId: string, data: string) => void;
   readonly onExit?: (ptyId: string, exitCode: number, signal?: string) => void;
   readonly logger?: AgentLogger;

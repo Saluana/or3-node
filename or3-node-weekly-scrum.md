@@ -56,24 +56,26 @@ This plan was built by comparing the `or3-net` planning docs in `planning/node-a
 
 ## Day 5 — Tighten feature truthfulness and capability reporting
 
-- [ ] Review capability advertisement so `info` and manifests reflect what the platform can really do today.
-- [ ] Make sure file, PTY, and service capabilities are only shown when they are truly enabled.
-- [ ] Clarify the supported platform matrix for Linux, macOS, and Windows in docs, matching the planning tasks that are still open.
-- [ ] Add tests for capability gating and platform-specific fallbacks.
+Note: full PTY will be implemented in `src/host-control/pty.ts` and `src/transport/agent-loop.ts` using Bun's Terminal API (`Bun.spawn({ terminal })` plus `proc.terminal.write/resize/close`) on Linux/macOS first. Windows stays hidden until a separate PTY path exists.
+
+- [x] Review capability advertisement so `info` and manifests reflect what the platform can really do today.
+- [x] Make sure file, PTY, and service capabilities are only shown when they are truly enabled.
+- [x] Clarify the supported platform matrix for Linux, macOS, and Windows in docs, matching the planning tasks that are still open.
+- [x] Add tests for capability gating and platform-specific fallbacks.
 
 ## Day 6 — Improve onboarding and operations
 
-- [ ] Add service-manager guidance for `systemd`, `launchd`, and Windows service usage as a follow-up path after the simple `launch` workflow.
-- [ ] Turn the smoke flow into a more repeatable end-to-end verification path for contributors.
-- [ ] Document how approval, credential refresh, reconnect, and stale-health recovery are expected to work in real life.
-- [ ] Add a troubleshooting section focused on the first 30 minutes after install.
+- [x] Add service-manager guidance for `systemd`, `launchd`, and Windows service usage as a follow-up path after the simple `launch` workflow.
+- [x] Turn the smoke flow into a more repeatable end-to-end verification path for contributors.
+- [x] Document how approval, credential refresh, reconnect, and stale-health recovery are expected to work in real life.
+- [x] Add a troubleshooting section focused on the first 30 minutes after install.
 
 ## Day 7 — Close the release-confidence gap
 
-- [ ] Add an end-to-end validation pass that covers install, launch, approve, connect, execute, abort, and reconnect.
-- [ ] Verify restart behavior for identity persistence, credential expiry, revocation, and stale session cleanup.
-- [ ] Review file-transfer and PTY limits for large-output and long-lived-session cases.
-- [ ] Turn the week’s findings into a short release-readiness checklist for future iterations.
+- [x] Add an end-to-end validation pass that covers install, launch, approve, connect, execute, abort, and reconnect.
+- [x] Verify restart behavior for identity persistence, credential expiry, revocation, and stale session cleanup.
+- [x] Review file-transfer and PTY limits for large-output and long-lived-session cases.
+- [x] Turn the week’s findings into a short release-readiness checklist for future iterations.
 
 ## Recommended order of attack
 

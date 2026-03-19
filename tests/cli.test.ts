@@ -4,9 +4,12 @@ import os from "node:os";
 import path from "node:path";
 
 import { runCli } from "../src/cli/index.ts";
-import { saveState } from "../src/config/store.ts";
+import { saveConfig, saveState } from "../src/config/store.ts";
+import { loadIdentity } from "../src/identity/store.ts";
+import { saveConnectionState } from "../src/info/connection-state.ts";
 import { resolveStoragePaths } from "../src/storage/paths.ts";
 import type { LogEntry } from "../src/utils/logger.ts";
+import { AGENT_VERSION } from "../src/version.ts";
 
 const tempHomes: string[] = [];
 
@@ -263,11 +266,33 @@ describe("or3-node cli", () => {
     });
 
     expect(exitCode).toBe(0);
-    expect(stdout.chunks.join("")).toContain("version:          0.1.0");
+    expect(stdout.chunks.join("")).toContain(`version:          ${AGENT_VERSION}`);
+    expect(stdout.chunks.join("")).toContain("capabilities:     exec");
+    expect(stdout.chunks.join("")).not.toContain("pty");
+    expect(stdout.chunks.join("")).not.toContain("service-launch");
     expect(stdout.chunks.join("")).toContain("enrollment:       not enrolled");
     expect(stdout.chunks.join("")).toContain("approval:         not enrolled");
     expect(stdout.chunks.join("")).toContain("credential:       missing");
     expect(stdout.chunks.join("")).toContain("connection:       unknown");
+  });
+
+  test("info advertises file capabilities only when allowed roots are configured", async () => {
+    await saveConfig({
+      controlPlaneUrl: "http://127.0.0.1:3001",
+      bootstrapToken: null,
+      nodeName: null,
+      allowedRoots: ["/tmp/or3-node-allowed"],
+      allowedEnvNames: [],
+    });
+
+    const stdout = createWriter();
+    const exitCode = await runCli(["info"], {
+      stdout: stdout.writer,
+      stderr: { write: () => true },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(stdout.chunks.join("")).toContain("capabilities:     exec, file-read, file-write");
   });
 
   test("status shows approved and valid runtime state clearly", async () => {
@@ -293,6 +318,33 @@ describe("or3-node cli", () => {
     expect(stdout.chunks.join("")).toContain(
       'next step: run "or3-node launch" to start the background agent, or use "--foreground" to keep it attached here',
     );
+  });
+
+  test("status reports the persisted transport connection state", async () => {
+    await saveConnectionState("disconnected", "socket failed after open");
+
+    const stdout = createWriter();
+    const exitCode = await runCli(["status"], {
+      stdout: stdout.writer,
+      stderr: { write: () => true },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(stdout.chunks.join("")).toContain("connection:       disconnected");
+  });
+
+  test("info surfaces the persisted recent transport error", async () => {
+    await saveConnectionState("disconnected", "socket failed after open");
+
+    const stdout = createWriter();
+    const exitCode = await runCli(["info"], {
+      stdout: stdout.writer,
+      stderr: { write: () => true },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(stdout.chunks.join("")).toContain("connection:       disconnected");
+    expect(stdout.chunks.join("")).toContain("recent error:     socket failed after open");
   });
 
   test("status marks expired credentials and points to refresh", async () => {
@@ -383,6 +435,28 @@ describe("or3-node cli", () => {
     expect(await fs.readFile(credentialPath, "utf8")).toContain("or3n_refresh_2");
   });
 
+  test("launch preserves the same identity across restart", async () => {
+    await runCli(["launch", "--url", "http://or3.test", "--token", "bootstrap-123"], {
+      fetch: () => Promise.resolve(pendingBootstrapResponse("node-persist-abc123")),
+      stdout: { write: () => true },
+      stderr: { write: () => true },
+    });
+
+    const firstIdentity = await loadIdentity();
+    await runCli(
+      ["launch", "--url", "http://or3.test", "--token", "bootstrap-123", "--no-interactive"],
+      {
+        fetch: () => Promise.resolve(pendingBootstrapResponse("node-persist-abc123")),
+        stdout: { write: () => true },
+        stderr: { write: () => true },
+      },
+    );
+    const secondIdentity = await loadIdentity();
+
+    expect(firstIdentity?.publicKeyBase64).toBe(secondIdentity?.publicKeyBase64);
+    expect(firstIdentity?.createdAt).toBe(secondIdentity?.createdAt);
+  });
+
   test("launch clears stored credentials when approval is no longer active", async () => {
     await runCli(["launch", "--url", "http://or3.test", "--token", "bootstrap-123"], {
       fetch: () =>
@@ -435,9 +509,9 @@ describe("or3-node cli", () => {
 
     expect(exitCode).toBe(0);
     expect(spawnedCommands).toEqual([["launch", "--foreground", "--no-interactive"]]);
-    expect(stdout.chunks.join("")).toContain("agent loop: started in background");
+    expect(stdout.chunks.join("")).toContain("agent loop: background launch requested");
     expect(stdout.chunks.join("")).toContain(
-      'next step: run "or3-node launch" to start the background agent, or use "--foreground" to keep it attached here',
+      'next step: run "or3-node status" to inspect local state, or use "--foreground" to keep it attached here',
     );
   });
 
@@ -467,6 +541,36 @@ describe("or3-node cli", () => {
     expect(stdout.chunks.join("")).toContain("agent loop: stopped");
   });
 
+  test("launch wires file operations in foreground mode when allowed roots are configured", async () => {
+    let fileServiceEnabled = false;
+
+    await saveConfig({
+      controlPlaneUrl: "http://127.0.0.1:3001",
+      bootstrapToken: null,
+      nodeName: null,
+      allowedRoots: ["/tmp/or3-node-allowed"],
+      allowedEnvNames: [],
+    });
+
+    const exitCode = await runCli(
+      ["launch", "--url", "http://or3.test", "--token", "bootstrap-123", "--foreground"],
+      {
+        fetch: () => Promise.resolve(approvedBootstrapResponse("node-files-abc123", "or3n_files")),
+        agentLoopFactory: (options) => ({
+          start: () => {
+            fileServiceEnabled = options.fileService?.isEnabled() ?? false;
+            return Promise.resolve();
+          },
+        }),
+        stdout: { write: () => true },
+        stderr: { write: () => true },
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(fileServiceEnabled).toBeTrue();
+  });
+
   test("reset clears local enrollment state while preserving operator config", async () => {
     await runCli(
       ["launch", "--url", "http://or3.test", "--token", "bootstrap-123", "--name", "devbox"],
@@ -485,8 +589,10 @@ describe("or3-node cli", () => {
       credentialFilePath: credentialPath,
       identityFilePath: identityPath,
       execHistoryFilePath: execHistoryPath,
+      connectionStateFilePath: connectionStatePath,
     } = resolveStoragePaths();
     await fs.writeFile(execHistoryPath, '[{"execId":"exec-1"}]\n', "utf8");
+    await saveConnectionState("disconnected", "stale socket error");
 
     const stdout = createWriter();
     const exitCode = await runCli(["reset"], {
@@ -513,5 +619,6 @@ describe("or3-node cli", () => {
     await expectMissingFile(credentialPath);
     await expectMissingFile(identityPath);
     await expectMissingFile(execHistoryPath);
+    await expectMissingFile(connectionStatePath);
   });
 });

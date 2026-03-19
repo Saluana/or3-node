@@ -121,10 +121,11 @@ export const saveState = async (state: NodeAgentState): Promise<void> => {
 };
 
 export const resetState = async (): Promise<void> => {
-  const { stateFilePath, credentialFilePath } = resolveStoragePaths();
+  const { stateFilePath, credentialFilePath, connectionStateFilePath } = resolveStoragePaths();
   await Promise.all([
     fs.rm(stateFilePath, { force: true }),
     fs.rm(credentialFilePath, { force: true }),
+    fs.rm(connectionStateFilePath, { force: true }),
   ]);
 };
 

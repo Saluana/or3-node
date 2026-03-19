@@ -12,9 +12,11 @@ import {
   saveState,
 } from "../config/store.ts";
 import type { LaunchCommandOptions, NodeAgentConfig, NodeAgentState } from "../config/types.ts";
+import { HostFileService } from "../host-control/files.ts";
 import { resetHostExecHistory } from "../host-control/history.ts";
 import { HostControlService } from "../host-control/service.ts";
 import { collectAgentInfo, formatAgentInfo } from "../info/agent-info.ts";
+import { loadConnectionState, type AgentConnectionState } from "../info/connection-state.ts";
 import { NodeAgentLoop } from "../transport/agent-loop.ts";
 import type { NodeAgentLoopOptions } from "../transport/agent-loop.ts";
 import { CliUsageError, ConfigError } from "../utils/errors.ts";
@@ -201,6 +203,13 @@ const handleLaunch = async (
 
   if (options.foreground) {
     stdout.write("agent loop: starting in foreground\n");
+    const fileService =
+      mergedConfig.allowedRoots.length > 0
+        ? new HostFileService({
+            allowedRoots: mergedConfig.allowedRoots,
+            logger,
+          })
+        : undefined;
     const agentLoop = (dependencies.agentLoopFactory ?? defaultAgentLoopFactory)({
       controlPlaneUrl: mergedConfig.controlPlaneUrl,
       credential: {
@@ -212,6 +221,7 @@ const handleLaunch = async (
         allowedEnvPassthrough: mergedConfig.allowedEnvNames,
         logger,
       }),
+      fileService,
       logger,
     });
     await agentLoop.start(dependencies.launchSignal);
@@ -224,8 +234,10 @@ const handleLaunch = async (
     "--foreground",
     "--no-interactive",
   ]);
-  stdout.write("agent loop: started in background\n");
-  stdout.write(`${renderNextStepLine(mergedConfig, nextState)}\n`);
+  stdout.write("agent loop: background launch requested\n");
+  stdout.write(
+    'next step: run "or3-node status" to inspect local state, or use "--foreground" to keep it attached here\n',
+  );
   return 0;
 };
 
@@ -233,11 +245,17 @@ const handleDoctor = async (
   stdout: Pick<typeof process.stdout, "write">,
   logger: AgentLogger,
 ): Promise<number> => {
-  const [config, state, identity] = await Promise.all([loadConfig(), loadState(), loadIdentity()]);
+  const [config, state, identity, connection] = await Promise.all([
+    loadConfig(),
+    loadState(),
+    loadIdentity(),
+    loadConnectionState(),
+  ]);
   logger.info(AgentEvent.INFO_COLLECT, "doctor collected local node status", {
     enrollment: getEnrollmentState(state),
     approval: getApprovalState(state),
     credential: getCredentialState(state),
+    connection: connection.connectionState,
   });
   stdout.write("or3-node doctor\n");
   stdout.write(`control plane url: ${config.controlPlaneUrl}\n`);
@@ -245,7 +263,7 @@ const handleDoctor = async (
   stdout.write(
     `identity: ${identity === null ? "missing" : `${identity.publicKeyBase64.slice(0, 16)}…`}\n`,
   );
-  stdout.write(renderLifecycleStatusLines(state));
+  stdout.write(renderLifecycleStatusLines(state, connection.connectionState));
   stdout.write(`${renderNextStepLine(config, state)}\n`);
   return 0;
 };
@@ -255,15 +273,16 @@ const handleInfo = async (
   logger: AgentLogger,
 ): Promise<number> => {
   const [config, state] = await Promise.all([loadConfig(), loadState()]);
-  const info = collectAgentInfo(config, getConnectionState());
+  const connection = await loadConnectionState();
+  const info = collectAgentInfo(config, connection.connectionState, connection.recentError);
   logger.info(AgentEvent.INFO_COLLECT, "agent info collected", {
     enrollment: getEnrollmentState(state),
     approval: getApprovalState(state),
     credential: getCredentialState(state),
-    connection: getConnectionState(),
+    connection: connection.connectionState,
   });
   stdout.write(formatAgentInfo(info));
-  stdout.write(renderLifecycleStatusLines(state));
+  stdout.write(renderLifecycleStatusLines(state, connection.connectionState));
   return 0;
 };
 
@@ -271,15 +290,19 @@ const handleStatus = async (
   stdout: Pick<typeof process.stdout, "write">,
   logger: AgentLogger,
 ): Promise<number> => {
-  const [config, state] = await Promise.all([loadConfig(), loadState()]);
+  const [config, state, connection] = await Promise.all([
+    loadConfig(),
+    loadState(),
+    loadConnectionState(),
+  ]);
   logger.info(AgentEvent.INFO_COLLECT, "status collected local node status", {
     enrollment: getEnrollmentState(state),
     approval: getApprovalState(state),
     credential: getCredentialState(state),
-    connection: getConnectionState(),
+    connection: connection.connectionState,
   });
   stdout.write("or3-node status\n");
-  stdout.write(renderLifecycleStatusLines(state));
+  stdout.write(renderLifecycleStatusLines(state, connection.connectionState));
   stdout.write(`${renderNextStepLine(config, state)}\n`);
   return 0;
 };
@@ -462,12 +485,15 @@ const renderNextStepLine = (config: NodeAgentConfig, state: NodeAgentState): str
   return 'next step: run "or3-node launch" to start the background agent, or use "--foreground" to keep it attached here';
 };
 
-const renderLifecycleStatusLines = (state: NodeAgentState): string =>
+const renderLifecycleStatusLines = (
+  state: NodeAgentState,
+  connectionState: AgentConnectionState,
+): string =>
   [
     `enrollment:       ${getEnrollmentState(state)}`,
     `approval:         ${getApprovalState(state)}`,
     `credential:       ${getCredentialState(state)}`,
-    `connection:       ${getConnectionState()}`,
+    `connection:       ${connectionState}`,
     `node id:          ${state.nodeId ?? "not enrolled"}`,
     `approved at:      ${state.approvedAt ?? "pending"}`,
     `credential until: ${state.credential.expiresAt ?? "unknown"}`,
@@ -490,8 +516,6 @@ const getCredentialState = (state: NodeAgentState): "missing" | "valid" | "expir
 
   return Date.parse(state.credential.expiresAt) <= Date.now() ? "expired" : "valid";
 };
-
-const getConnectionState = (): "connected" | "disconnected" | "unknown" => "unknown";
 
 const toErrorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : "unknown error";

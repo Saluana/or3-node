@@ -6,6 +6,10 @@ import type { HostExecHandle, HostExecRequest } from "../host-control/types.ts";
 import type { HostFileService } from "../host-control/files.ts";
 import type { HostPtyService } from "../host-control/pty.ts";
 import type { HostServiceManager } from "../host-control/services.ts";
+import {
+  saveConnectionState,
+  type AgentConnectionState,
+} from "../info/connection-state.ts";
 import { AgentEvent, createNoopAgentLogger, type AgentLogger } from "../utils/logger.ts";
 
 export interface AgentLoopCredential {
@@ -36,6 +40,10 @@ export interface NodeAgentLoopOptions {
   readonly reconnectJitterRatio?: number;
   readonly random?: () => number;
   readonly sessionLogLimit?: number;
+  readonly persistConnectionState?: (
+    connectionState: AgentConnectionState,
+    recentError?: string | null,
+  ) => Promise<void> | void;
   readonly logger?: AgentLogger;
 }
 
@@ -74,6 +82,10 @@ export class NodeAgentLoop {
   private readonly reconnectJitterRatio: number;
   private readonly random: () => number;
   private readonly sessionLogLimit: number;
+  private readonly persistConnectionState: (
+    connectionState: AgentConnectionState,
+    recentError?: string | null,
+  ) => Promise<void> | void;
   private readonly logger: AgentLogger;
 
   public constructor(private readonly options: NodeAgentLoopOptions) {
@@ -85,6 +97,7 @@ export class NodeAgentLoop {
     this.reconnectJitterRatio = options.reconnectJitterRatio ?? DEFAULT_RECONNECT_JITTER_RATIO;
     this.random = options.random ?? Math.random;
     this.sessionLogLimit = options.sessionLogLimit ?? DEFAULT_SESSION_LOG_LIMIT;
+    this.persistConnectionState = options.persistConnectionState ?? saveConnectionState;
     this.logger = options.logger ?? createNoopAgentLogger();
   }
 
@@ -126,6 +139,7 @@ export class NodeAgentLoop {
     };
     socket.onclose = () => {
       if (opened) {
+        this.updateConnectionState("disconnected");
         logDisconnect("warn", "transport disconnected", {
           control_plane_url: this.options.controlPlaneUrl,
           failure_class: "transport",
@@ -136,6 +150,7 @@ export class NodeAgentLoop {
     await new Promise<void>((resolve, reject) => {
       socket.onopen = () => {
         opened = true;
+        this.updateConnectionState("connected");
         this.logger.info(AgentEvent.CONNECT, "transport connected", {
           control_plane_url: this.options.controlPlaneUrl,
         });
@@ -147,6 +162,7 @@ export class NodeAgentLoop {
       socket.onerror = (event) => {
         const errorMessage = toErrorMessage(event.error);
         if (!opened) {
+          this.updateConnectionState("disconnected", errorMessage);
           this.logger.error(getConnectFailureEvent(errorMessage), "transport connection failed", {
             control_plane_url: this.options.controlPlaneUrl,
             error: errorMessage,
@@ -155,6 +171,7 @@ export class NodeAgentLoop {
           reject(event.error instanceof Error ? event.error : new Error("websocket open failed"));
           return;
         }
+        this.updateConnectionState("disconnected", errorMessage);
         logDisconnect("error", "transport errored after connect", {
           control_plane_url: this.options.controlPlaneUrl,
           error: errorMessage,
@@ -164,6 +181,15 @@ export class NodeAgentLoop {
       };
     });
     await closed;
+  }
+
+  private updateConnectionState(
+    connectionState: AgentConnectionState,
+    recentError: string | null = null,
+  ): void {
+    void Promise.resolve(this.persistConnectionState(connectionState, recentError)).catch(
+      () => undefined,
+    );
   }
 
   public async start(signal?: AbortSignal): Promise<void> {
