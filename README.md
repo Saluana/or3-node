@@ -76,18 +76,22 @@ The shipped CLI name stays short (`or3-node`) even though the planning docs may 
 
 - `exec` is always advertised.
 - `file-read` and `file-write` are only advertised when `allowedRoots` is configured and the default launch path wires `HostFileService`.
-- `pty` and `service-launch` are intentionally not advertised yet, even though scaffold code exists, because they are not fully implemented end-to-end in the default agent runtime.
+- `pty` is advertised only on Linux and macOS when the Bun Terminal-backed host PTY service is enabled in the default runtime path.
+- `service-launch` remains hidden until the service story is stronger than the current scaffold.
 
-## Full PTY follow-up
+## PTY support
 
-Full PTY support will land in `src/host-control/pty.ts` and `src/transport/agent-loop.ts`, with regression coverage in `tests/host-control-pty.test.ts` and transport-level PTY tests.
+Full PTY support now ships through `src/host-control/pty.ts` and `src/transport/agent-loop.ts`, with regression coverage in `tests/host-control-pty.test.ts` and transport-level PTY tests.
 
-Planned implementation:
+- Linux and macOS use Bun's Terminal API through `Bun.spawn({ terminal: { cols, rows, data, exit, drain } })`.
+- PTY lifecycle uses `proc.terminal.write(...)`, `proc.terminal.resize(...)`, `proc.terminal.setRawMode(...)`, and `proc.terminal.close()`.
+- PTY output and exit stream through the existing `pty_*` RPC path and surface in the OR3 Net runtime-session layer.
+- Windows PTY stays hidden for this phase because Bun's Terminal API is POSIX-only today.
 
-- switch the current pipe-backed fallback in `HostPtyService` to Bun's Terminal API on POSIX (`Bun.spawn({ terminal: { cols, rows, data, exit, drain } })`)
-- drive PTY lifecycle through `proc.terminal.write(...)`, `proc.terminal.resize(...)`, `proc.terminal.setRawMode(...)`, and `proc.terminal.close()`
-- stream PTY output through the existing `pty_*` RPC methods in `src/transport/agent-loop.ts` before re-advertising `pty`
-- keep PTY hidden on Windows until there is a separate Windows-specific implementation path, because Bun's Terminal API is POSIX-only today
+Verification:
+
+- Linux/macOS: confirm `or3-node info` advertises `pty`, then run the PTY smoke and release-validation steps.
+- Windows: confirm `or3-node info` does not advertise `pty` and that PTY open requests fail clearly instead of degrading to pipes.
 
 ## Structured logs
 

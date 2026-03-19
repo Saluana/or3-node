@@ -142,9 +142,10 @@ Recovery:
 
 #### PTY or service-launch expected but not shown
 
-This is expected today.
+This depends on platform and wiring.
 
-- PTY remains hidden until the Bun Terminal implementation is completed on Linux/macOS
+- PTY is expected on Linux/macOS when the default host-control runtime is active
+- PTY remains hidden on Windows because Bun's Terminal API is POSIX-only in this phase
 - service-launch remains hidden until the operational story is stronger than the current local process manager scaffold
 
 ## When to reset
@@ -180,10 +181,10 @@ These are the practical Day 7 limits to keep in mind when validating or sizing d
 
 ### PTY limits
 
-- current PTY implementation is still a pipe-backed compatibility scaffold
-- PTY is not advertised today
+- Linux/macOS PTY uses Bun's Terminal API through the default runtime path
+- PTY is advertised on supported POSIX hosts and stays hidden on Windows
 - max concurrent PTY sessions: `4` by default
-- resize is still a no-op until the Bun Terminal implementation lands
+- resize is supported on the live PTY session
 
 ### Long-lived session limits
 

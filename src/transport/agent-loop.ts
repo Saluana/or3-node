@@ -4,7 +4,7 @@ import { nodeTransportFrameSchema } from "or3-net";
 import type { HostControlService } from "../host-control/service.ts";
 import type { HostExecHandle, HostExecRequest } from "../host-control/types.ts";
 import type { HostFileService } from "../host-control/files.ts";
-import type { HostPtyService } from "../host-control/pty.ts";
+import { HostPtyService } from "../host-control/pty.ts";
 import type { HostServiceManager } from "../host-control/services.ts";
 import {
   saveConnectionState,
@@ -75,6 +75,7 @@ const DEFAULT_SESSION_LOG_CHUNK_MAX_BYTES = 8 * 1024;
 export class NodeAgentLoop {
   private readonly activeExecs = new Map<string, HostExecHandle>();
   private readonly sessions = new Map<string, AgentSession>();
+  private readonly ptyRequestIds = new Map<string, string>();
   private readonly webSocketFactory: (url: string) => WebSocketLike;
   private readonly reconnectDelayMs: number;
   private readonly maxReconnectDelayMs: number;
@@ -86,9 +87,12 @@ export class NodeAgentLoop {
     connectionState: AgentConnectionState,
     recentError?: string | null,
   ) => Promise<void> | void;
+  private readonly ptyService: HostPtyService;
   private readonly logger: AgentLogger;
+  private currentSocket: WebSocketLike | null = null;
 
   public constructor(private readonly options: NodeAgentLoopOptions) {
+    this.logger = options.logger ?? createNoopAgentLogger();
     this.webSocketFactory =
       options.webSocketFactory ?? ((url) => new WebSocket(url) as unknown as WebSocketLike);
     this.reconnectDelayMs = options.reconnectDelayMs ?? DEFAULT_RECONNECT_DELAY_MS;
@@ -98,13 +102,26 @@ export class NodeAgentLoop {
     this.random = options.random ?? Math.random;
     this.sessionLogLimit = options.sessionLogLimit ?? DEFAULT_SESSION_LOG_LIMIT;
     this.persistConnectionState = options.persistConnectionState ?? saveConnectionState;
-    this.logger = options.logger ?? createNoopAgentLogger();
+    this.ptyService =
+      options.ptyService ??
+      new HostPtyService({
+        allowedRoots: options.hostControl.getConfig().allowedRoots,
+        allowedEnvNames: options.hostControl.getConfig().allowedEnvPassthrough,
+        logger: this.logger,
+        onOutput: (ptyId, data) => {
+          this.emitPtyOutput(ptyId, data);
+        },
+        onExit: (ptyId, exitCode, signal) => {
+          this.emitPtyExit(ptyId, exitCode, signal);
+        },
+      });
   }
 
   public async connectOnce(): Promise<void> {
     const socket = this.webSocketFactory(
       buildTransportUrl(this.options.controlPlaneUrl, this.options.credential.token),
     );
+    this.currentSocket = socket;
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
     let opened = false;
     let closedResolved = false;
@@ -128,6 +145,9 @@ export class NodeAgentLoop {
       }
       if (!closedResolved) {
         closedResolved = true;
+        this.currentSocket = null;
+        this.ptyService.closeAll();
+        this.ptyRequestIds.clear();
         resolveClosed?.();
       }
     };
@@ -335,7 +355,7 @@ export class NodeAgentLoop {
       case "file_browse":
         return this.handleFileBrowse(request.id, request.params);
       case "pty_open":
-        return this.handlePtyOpen(socket, request.id, request.params);
+        return this.handlePtyOpen(request.id, request.params);
       case "pty_input":
         return this.handlePtyInput(request.id, request.params);
       case "pty_resize":
@@ -640,7 +660,6 @@ export class NodeAgentLoop {
   }
 
   private handlePtyOpen(
-    socket: WebSocketLike,
     requestId: string,
     params: {
       session_id: string;
@@ -652,11 +671,8 @@ export class NodeAgentLoop {
       cwd?: string;
     },
   ): RpcResult {
-    if (this.options.ptyService === undefined) {
-      return this.unsupportedCapability(requestId, "pty_open", "PTY is not enabled");
-    }
     try {
-      const session = this.options.ptyService.open({
+      const session = this.ptyService.open({
         sessionId: params.session_id,
         cols: params.cols,
         rows: params.rows,
@@ -665,11 +681,7 @@ export class NodeAgentLoop {
         env: params.env,
         cwd: params.cwd,
       });
-      // Wire output events to the socket
-      const originalOnOutput = this.options.ptyService.constructor.name;
-      void originalOnOutput;
-      // PTY output is wired via the HostPtyService constructor onOutput callback,
-      // but we also send event frames for the specific request
+      this.ptyRequestIds.set(session.ptyId, requestId);
       return okResult(requestId, {
         output_text: session.ptyId,
         artifacts: [],
@@ -685,10 +697,7 @@ export class NodeAgentLoop {
   }
 
   private handlePtyInput(requestId: string, params: { pty_id: string; data: string }): RpcResult {
-    if (this.options.ptyService === undefined) {
-      return this.unsupportedCapability(requestId, "pty_input", "PTY is not enabled");
-    }
-    const session = this.options.ptyService.get(params.pty_id);
+    const session = this.ptyService.get(params.pty_id);
     if (session === null) {
       return errorResult(requestId, "pty_not_found", `PTY ${params.pty_id} not found`);
     }
@@ -700,10 +709,7 @@ export class NodeAgentLoop {
     requestId: string,
     params: { pty_id: string; cols: number; rows: number },
   ): RpcResult {
-    if (this.options.ptyService === undefined) {
-      return this.unsupportedCapability(requestId, "pty_resize", "PTY is not enabled");
-    }
-    const session = this.options.ptyService.get(params.pty_id);
+    const session = this.ptyService.get(params.pty_id);
     if (session === null) {
       return errorResult(requestId, "pty_not_found", `PTY ${params.pty_id} not found`);
     }
@@ -712,15 +718,59 @@ export class NodeAgentLoop {
   }
 
   private handlePtyClose(requestId: string, params: { pty_id: string }): RpcResult {
-    if (this.options.ptyService === undefined) {
-      return this.unsupportedCapability(requestId, "pty_close", "PTY is not enabled");
-    }
-    const session = this.options.ptyService.get(params.pty_id);
+    const session = this.ptyService.get(params.pty_id);
     if (session === null) {
       return okResult(requestId, { output_text: "closed", artifacts: [], meta: {} });
     }
     session.close();
     return okResult(requestId, { output_text: "closed", artifacts: [], meta: {} });
+  }
+
+  private emitPtyOutput(ptyId: string, data: string): void {
+    const socket = this.currentSocket;
+    const requestId = this.ptyRequestIds.get(ptyId);
+    if (socket === null || requestId === undefined || data.length === 0) {
+      return;
+    }
+    socket.send(
+      JSON.stringify({
+        type: "event",
+        request_id: requestId,
+        payload: {
+          event: "pty_output",
+          data: {
+            pty_id: ptyId,
+            text: data,
+          },
+        },
+      }),
+    );
+  }
+
+  private emitPtyExit(ptyId: string, exitCode: number, signal?: string): void {
+    const socket = this.currentSocket;
+    const requestId = this.ptyRequestIds.get(ptyId);
+    if (requestId === undefined) {
+      return;
+    }
+    this.ptyRequestIds.delete(ptyId);
+    if (socket === null) {
+      return;
+    }
+    socket.send(
+      JSON.stringify({
+        type: "event",
+        request_id: requestId,
+        payload: {
+          event: "pty_exit",
+          data: {
+            pty_id: ptyId,
+            exit_code: exitCode,
+            signal: signal ?? null,
+          },
+        },
+      }),
+    );
   }
 
   private handleServiceLaunch(

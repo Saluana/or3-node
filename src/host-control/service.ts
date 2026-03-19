@@ -11,6 +11,7 @@ import type {
   HostExecSnapshot,
   HostExecStatus,
 } from "./types.ts";
+import { validateRequestedEnv } from "./env-policy.ts";
 import { resolveAllowedWorkingDirectory } from "./paths.ts";
 import { ConfigError } from "../utils/errors.ts";
 import { AgentEvent, createNoopAgentLogger, type AgentLogger } from "../utils/logger.ts";
@@ -350,16 +351,6 @@ const appendBounded = (
     value: nextBuffer.subarray(0, maxBytes).toString("utf8"),
     truncated: true,
   };
-};
-
-const validateRequestedEnv = (
-  requestedEnv: Readonly<Record<string, string>>,
-  allowedNames: readonly string[],
-): void => {
-  const disallowed = Object.keys(requestedEnv).filter((name) => !allowedNames.includes(name));
-  if (disallowed[0] !== undefined) {
-    throw new ConfigError(`env vars are outside allowlist: ${disallowed.join(", ")}`);
-  }
 };
 
 const toSnapshot = (result: HostExecResult): HostExecSnapshot => ({

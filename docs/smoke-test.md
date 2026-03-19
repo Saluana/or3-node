@@ -209,7 +209,7 @@ before the next verification cycle.
 | Node stays "pending"      | Approve the node from the control plane             |
 | "credential expired"      | Re-run `or3-node launch` to refresh credentials     |
 | Connection health "stale" | Verify network between agent and control plane      |
-| PTY not available         | Expected today — full PTY is not advertised until the Bun Terminal implementation lands on Linux/macOS |
+| PTY not available         | Expected on Windows or when PTY is disabled; on Linux/macOS confirm `or3-node info` advertises `pty` and the foreground runtime is using the default PTY wiring |
 
 For more day-to-day operational behavior and recovery guidance, see
 [docs/operations.md](operations.md). 

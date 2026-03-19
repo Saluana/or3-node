@@ -8,6 +8,7 @@ import { saveConfig, saveState } from "../src/config/store.ts";
 import { loadIdentity } from "../src/identity/store.ts";
 import { saveConnectionState } from "../src/info/connection-state.ts";
 import { resolveStoragePaths } from "../src/storage/paths.ts";
+import { isPtySupportedPlatform } from "../src/runtime-capabilities.ts";
 import type { LogEntry } from "../src/utils/logger.ts";
 import { AGENT_VERSION } from "../src/version.ts";
 
@@ -267,8 +268,9 @@ describe("or3-node cli", () => {
 
     expect(exitCode).toBe(0);
     expect(stdout.chunks.join("")).toContain(`version:          ${AGENT_VERSION}`);
-    expect(stdout.chunks.join("")).toContain("capabilities:     exec");
-    expect(stdout.chunks.join("")).not.toContain("pty");
+    expect(stdout.chunks.join("")).toContain(
+      isPtySupportedPlatform() ? "capabilities:     exec, pty" : "capabilities:     exec",
+    );
     expect(stdout.chunks.join("")).not.toContain("service-launch");
     expect(stdout.chunks.join("")).toContain("enrollment:       not enrolled");
     expect(stdout.chunks.join("")).toContain("approval:         not enrolled");
@@ -292,7 +294,14 @@ describe("or3-node cli", () => {
     });
 
     expect(exitCode).toBe(0);
-    expect(stdout.chunks.join("")).toContain("capabilities:     exec, file-read, file-write");
+    expect(stdout.chunks.join("")).toContain(
+      isPtySupportedPlatform()
+        ? "capabilities:     exec, file-read, file-write, pty"
+        : "capabilities:     exec, file-read, file-write",
+    );
+    if (isPtySupportedPlatform()) {
+      expect(stdout.chunks.join("")).toContain("pty");
+    }
   });
 
   test("status shows approved and valid runtime state clearly", async () => {

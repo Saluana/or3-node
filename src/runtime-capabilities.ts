@@ -10,7 +10,7 @@ export const resolveAdvertisedRuntimeCapabilities = (
   config: Pick<NodeAgentConfig, "allowedRoots">,
 ): AgentRuntimeCapabilities => ({
   fileOperations: config.allowedRoots.length > 0,
-  pty: false,
+  pty: isPtySupportedPlatform(),
   serviceLaunch: false,
 });
 
@@ -33,3 +33,6 @@ export const buildAdvertisedCapabilityList = (
 export const getAdvertisedCapabilityList = (
   config: Pick<NodeAgentConfig, "allowedRoots">,
 ): string[] => buildAdvertisedCapabilityList(resolveAdvertisedRuntimeCapabilities(config));
+
+export const isPtySupportedPlatform = (): boolean =>
+  process.platform === "linux" || process.platform === "darwin";

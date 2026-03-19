@@ -100,7 +100,23 @@ Expected result:
 - local logs show execution lifecycle events
 - the node remains healthy after execution
 
-## 7. Abort a running command
+## 7. Exercise PTY on supported hosts
+
+On Linux/macOS, use the control-plane runtime-session PTY route to open a PTY,
+write a simple command such as `printf 'hello from pty\n'`, and then close it.
+
+Expected result on Linux/macOS:
+
+- `or3-node info` advertises `pty`
+- PTY output streams back through the runtime-session PTY endpoint
+- PTY exit is observed after close or process termination
+
+Expected result on Windows:
+
+- `or3-node info` does not advertise `pty`
+- PTY open fails clearly with an unsupported-capability/platform error
+
+## 8. Abort a running command
 
 Trigger a long-running remote exec, then send an abort.
 
@@ -115,7 +131,7 @@ Expected result:
 - the command terminates early
 - local logs show an abort or disconnected execution path instead of hanging forever
 
-## 8. Reconnect exercise
+## 9. Reconnect exercise
 
 With the foreground loop running:
 
@@ -129,7 +145,7 @@ Expected result:
 - once connectivity returns, `transport.connect` appears again
 - shutdown during reconnect wait does not hang through the whole backoff window
 
-## 9. Restart behavior verification
+## 10. Restart behavior verification
 
 Restart the node process and re-run:
 
@@ -146,7 +162,7 @@ Expected result:
 - revoked approval clears stale runtime credentials on the next launch
 - in-memory runtime sessions do not survive restart and are treated as cleaned up
 
-## 10. Final cleanup
+## 11. Final cleanup
 
 ```bash
 or3-node reset
@@ -163,6 +179,7 @@ Expected result:
 - approval path works
 - connection path works
 - execute path works
+- PTY path matches the platform support matrix
 - abort path works
 - reconnect path works
 - restart semantics match expectations

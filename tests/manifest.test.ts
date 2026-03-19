@@ -5,6 +5,7 @@ import { buildSignedManifest } from "../src/enroll/manifest.ts";
 import type { NodeAgentConfig } from "../src/config/types.ts";
 import type { NodeIdentityRecord } from "../src/identity/store.ts";
 import { AGENT_VERSION } from "../src/version.ts";
+import { isPtySupportedPlatform } from "../src/runtime-capabilities.ts";
 
 const createIdentity = (): NodeIdentityRecord => {
   const keyPair = nacl.sign.keyPair();
@@ -28,7 +29,9 @@ describe("buildSignedManifest", () => {
   test("advertises only exec by default", () => {
     const manifest = buildSignedManifest(createIdentity(), createConfig());
 
-    expect(manifest.capabilities).toEqual(["exec"]);
+    expect(manifest.capabilities).toEqual(
+      isPtySupportedPlatform() ? ["exec", "pty"] : ["exec"],
+    );
   });
 
   test("advertises file capabilities when allowed roots are configured", () => {
@@ -37,7 +40,11 @@ describe("buildSignedManifest", () => {
       createConfig({ allowedRoots: ["/tmp/or3-node-allowed"] }),
     );
 
-    expect(manifest.capabilities).toEqual(["exec", "file-read", "file-write"]);
+    expect(manifest.capabilities).toEqual(
+      isPtySupportedPlatform()
+        ? ["exec", "file-read", "file-write", "pty"]
+        : ["exec", "file-read", "file-write"],
+    );
   });
 
   test("uses the shared agent version", () => {

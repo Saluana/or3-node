@@ -25,7 +25,7 @@ Use this as the short Day 7 release-confidence checklist.
 ## Capability truthfulness
 
 - file capability is only advertised when enabled and wired
-- PTY remains hidden until Bun Terminal-backed implementation is complete
+- PTY is advertised only on Linux/macOS when the Bun Terminal-backed runtime path is active
 - service-launch remains hidden until the service story is stronger than today’s scaffold
 
 ## Limits and known constraints
@@ -50,4 +50,4 @@ Ship only if:
 
 - the Day 7 validation pass succeeds end-to-end
 - no known truthfulness mismatch remains in CLI or docs
-- current PTY and service limitations are documented, not implied away
+- current PTY platform limits and service limitations are documented, not implied away

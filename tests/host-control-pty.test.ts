@@ -205,4 +205,49 @@ describe("HostPtyService", () => {
     expect(entries.some((entry) => entry.event === "pty.open")).toBe(true);
     expect(entries.some((entry) => entry.event === "pty.exit")).toBe(true);
   });
+
+  test("rejects PTY env vars outside the allowlist", () => {
+    if (!PTY_SUPPORTED) {
+      return;
+    }
+    service = new HostPtyService({ allowedEnvNames: [] });
+    expect(() =>
+      service.open({
+        sessionId: "sess_env_blocked",
+        command: "cat",
+        env: { AWS_SECRET_ACCESS_KEY: "blocked" },
+      }),
+    ).toThrow("env vars are outside allowlist");
+  });
+
+  test("allows PTY env vars that are explicitly allowlisted", async () => {
+    if (!PTY_SUPPORTED) {
+      return;
+    }
+    const outputs: string[] = [];
+    service = new HostPtyService({
+      allowedEnvNames: ["ALLOWED_NAME"],
+      onOutput: (_id, data) => outputs.push(data),
+    });
+    const session = service.open({
+      sessionId: "sess_env_allowed",
+      command: "/bin/sh",
+      args: ["-c", 'printf "%s\\n" "$ALLOWED_NAME"'],
+      env: { ALLOWED_NAME: "ok" },
+    });
+
+    await new Promise<void>((resolve) => {
+      const check = (): void => {
+        if (outputs.some((entry) => entry.includes("ok"))) {
+          resolve();
+        } else {
+          setTimeout(check, 50);
+        }
+      };
+      setTimeout(check, 50);
+    });
+
+    expect(outputs.some((entry) => entry.includes("ok"))).toBe(true);
+    session.close();
+  });
 });
