@@ -16,33 +16,33 @@ _Scope:_ static review of `index.ts`, every file under `src/`, and the existing 
 
 ### Security / correctness issues to fix first
 
-- [ ] **`src/config/store.ts:40-44` — `config.json` is written without locked-down permissions.**  
+- [x] **`src/config/store.ts:40-44` — `config.json` is written without locked-down permissions.**  
   `saveConfig()` persists `bootstrapToken` to disk using a plain `writeFile(..., "utf8")`. Unlike `credentials.json`, there is no `mode: 0o600` / `chmod(0o600)`. On multi-user systems this can expose a still-valid bootstrap token to other local users.
 
-- [ ] **`src/identity/store.ts:39-42` — `identity.json` stores the node signing secret without `0600` permissions.**  
+- [x] **`src/identity/store.ts:39-42` — `identity.json` stores the node signing secret without `0600` permissions.**  
   `ensureIdentity()` writes `secretKeyBase64` with default permissions. That private key is enough to impersonate the node when signing manifests.
 
-- [ ] **`src/host-control/paths.ts:13-27` — cwd allow-root checks are vulnerable to symlink escapes.**  
+- [x] **`src/host-control/paths.ts:13-27` — cwd allow-root checks are vulnerable to symlink escapes.**  
   `resolveAllowedWorkingDirectory()` uses `path.resolve()` and string-prefix checks, but never canonicalizes with `realpath()`. A symlink inside an allowed root can therefore point the child process outside the sandbox while still passing validation.
 
-- [ ] **`src/transport/agent-loop.ts:157-158,238-245` — malformed inbound frames can escape as unhandled async errors.**  
+- [x] **`src/transport/agent-loop.ts:157-158,238-245` — malformed inbound frames can escape as unhandled async errors.**  
   `socket.onmessage` fires `void this.handleIncomingFrame(...)`, and `handleIncomingFrame()` immediately does `JSON.parse(raw)` plus schema parsing without its own `try/catch`. A malformed or hostile frame can therefore produce an unhandled rejection instead of a controlled transport error.
 
-- [ ] **`src/transport/agent-loop.ts:864-868` — secure `wss://` base URLs are downgraded to `ws://`.**  
+- [x] **`src/transport/agent-loop.ts:864-868` — secure `wss://` base URLs are downgraded to `ws://`.**  
   `buildTransportUrl()` maps `https:` to `wss:`, but maps **every other protocol** to `ws:`. If the configured control-plane URL is already `wss://...`, the generated transport URL becomes insecure `ws://...`.
 
 ### Medium-priority bugs / hardening items
 
-- [ ] **`src/host-control/files.ts:174-182` — file access validates the canonical path but returns the unresolved path.**  
+- [x] **`src/host-control/files.ts:174-182` — file access validates the canonical path but returns the unresolved path.**  
   `resolveAllowedPath()` checks `canonicalPath` against allowed roots, then returns `resolved` instead of the canonical path it just validated. That leaves file operations exposed to re-resolution/symlink-swap races after validation.
 
-- [ ] **`src/host-control/files.ts:249-258` — directory browse silently hides metadata failures.**  
+- [x] **`src/host-control/files.ts:249-258` — directory browse silently hides metadata failures.**  
   `walkDir()` swallows all `fs.stat()` errors and emits a bare `{ path, kind: "file" }`. Permission problems and broken filesystem states become invisible to the caller, which makes debugging file-access issues harder.
 
-- [ ] **`src/host-control/service.ts:339-352` — stdout/stderr truncation can split UTF-8 characters.**  
+- [x] **`src/host-control/service.ts:339-352` — stdout/stderr truncation can split UTF-8 characters.**  
   `appendBounded()` truncates by raw bytes and then decodes the clipped byte slice as UTF-8. If a multibyte code point lands on the boundary, the stored preview can contain replacement characters / corrupted text.
 
-- [ ] **`src/transport/agent-loop.ts:928-936` — session log chunk clipping has the same UTF-8 boundary bug.**  
+- [x] **`src/transport/agent-loop.ts:928-936` — session log chunk clipping has the same UTF-8 boundary bug.**  
   `clipSessionLogChunk()` uses the same byte-slice-then-decode approach as `appendBounded()`.
 
 ### Latent / currently less-exposed issues
@@ -55,12 +55,12 @@ _Scope:_ static review of `index.ts`, every file under `src/`, and the existing 
 
 ## Recommended regression tests to add with the fixes
 
-- [ ] Add a test proving `config.json` is created with `0600` permissions when it contains a bootstrap token.
-- [ ] Add a test proving `identity.json` is created with `0600` permissions.
-- [ ] Add a symlink-escape regression test for `resolveAllowedWorkingDirectory()`.
-- [ ] Add a malformed-WebSocket-frame test for `NodeAgentLoop.handleIncomingFrame()` / the `onmessage` path.
-- [ ] Add a test proving `buildTransportUrl()` preserves `wss://` inputs.
-- [ ] Add UTF-8 truncation regression tests for both exec previews and session log clipping.
+- [x] Add a test proving `config.json` is created with `0600` permissions when it contains a bootstrap token.
+- [x] Add a test proving `identity.json` is created with `0600` permissions.
+- [x] Add a symlink-escape regression test for `resolveAllowedWorkingDirectory()`.
+- [x] Add a malformed-WebSocket-frame test for `NodeAgentLoop.handleIncomingFrame()` / the `onmessage` path.
+- [x] Add a test proving `buildTransportUrl()` preserves `wss://` inputs.
+- [x] Add UTF-8 truncation regression tests for both exec previews and session log clipping.
 
 ## File-by-file review coverage
 
