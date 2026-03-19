@@ -33,8 +33,11 @@ const canonicalizePath = (targetPath: string): string => {
   try {
     return realpathSync(resolvedPath);
   } catch (error: unknown) {
-    if (isMissingPathError(error) || isPermissionError(error)) {
-      throw new ConfigError(`cwd could not be resolved: ${resolvedPath}`);
+    if (isMissingPathError(error)) {
+      throw new ConfigError(`cwd does not exist: ${resolvedPath}`);
+    }
+    if (isPermissionError(error)) {
+      throw new ConfigError(`cwd permission denied: ${resolvedPath}`);
     }
     throw error;
   }
