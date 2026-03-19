@@ -4,8 +4,13 @@ import { nodeTransportFrameSchema } from "or3-net";
 import type { HostControlService } from "../host-control/service.ts";
 import type { HostExecHandle, HostExecRequest } from "../host-control/types.ts";
 import type { HostFileService } from "../host-control/files.ts";
-import type { HostPtyService } from "../host-control/pty.ts";
+import { HostPtyService } from "../host-control/pty.ts";
 import type { HostServiceManager } from "../host-control/services.ts";
+import {
+  saveConnectionState,
+  type AgentConnectionState,
+} from "../info/connection-state.ts";
+import { AgentEvent, createNoopAgentLogger, type AgentLogger } from "../utils/logger.ts";
 
 export interface AgentLoopCredential {
   readonly token: string;
@@ -32,41 +37,107 @@ export interface NodeAgentLoopOptions {
   readonly reconnectDelayMs?: number;
   readonly maxReconnectDelayMs?: number;
   readonly heartbeatIntervalMs?: number;
+  readonly reconnectJitterRatio?: number;
+  readonly random?: () => number;
+  readonly sessionLogLimit?: number;
+  readonly persistConnectionState?: (
+    connectionState: AgentConnectionState,
+    recentError?: string | null,
+  ) => Promise<void> | void;
+  readonly logger?: AgentLogger;
 }
 
 /** Purpose: Agent sessions track exec log history for get_logs support. */
+type AgentSessionLogStream = "stdout" | "stderr" | "system";
+
+interface AgentSessionLogChunk {
+  readonly cursor: number;
+  readonly stream: AgentSessionLogStream;
+  readonly message: string;
+  readonly created_at: string;
+}
+
 interface AgentSession {
   readonly sessionId: string;
   readonly workspaceId: string;
   readonly createdAt: string;
-  readonly logs: { stream: string; message: string; created_at: string }[];
+  readonly logs: AgentSessionLogChunk[];
+  nextCursor: number;
   status: "ready" | "destroyed";
 }
+
+const DEFAULT_RECONNECT_DELAY_MS = 500;
+const DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000;
+const DEFAULT_RECONNECT_JITTER_RATIO = 0.25;
+const DEFAULT_SESSION_LOG_LIMIT = 256;
+const DEFAULT_SESSION_LOG_CHUNK_MAX_BYTES = 8 * 1024;
 
 export class NodeAgentLoop {
   private readonly activeExecs = new Map<string, HostExecHandle>();
   private readonly sessions = new Map<string, AgentSession>();
+  private readonly ptyRequestIds = new Map<string, string>();
   private readonly webSocketFactory: (url: string) => WebSocketLike;
   private readonly reconnectDelayMs: number;
   private readonly maxReconnectDelayMs: number;
   private readonly heartbeatIntervalMs: number;
+  private readonly reconnectJitterRatio: number;
+  private readonly random: () => number;
+  private readonly sessionLogLimit: number;
+  private readonly persistConnectionState: (
+    connectionState: AgentConnectionState,
+    recentError?: string | null,
+  ) => Promise<void> | void;
+  private readonly ptyService: HostPtyService;
+  private readonly logger: AgentLogger;
+  private currentSocket: WebSocketLike | null = null;
 
   public constructor(private readonly options: NodeAgentLoopOptions) {
+    this.logger = options.logger ?? createNoopAgentLogger();
     this.webSocketFactory =
       options.webSocketFactory ?? ((url) => new WebSocket(url) as unknown as WebSocketLike);
-    this.reconnectDelayMs = options.reconnectDelayMs ?? 100;
-    this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? 1_000;
+    this.reconnectDelayMs = options.reconnectDelayMs ?? DEFAULT_RECONNECT_DELAY_MS;
+    this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? DEFAULT_MAX_RECONNECT_DELAY_MS;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 5_000;
+    this.reconnectJitterRatio = options.reconnectJitterRatio ?? DEFAULT_RECONNECT_JITTER_RATIO;
+    this.random = options.random ?? Math.random;
+    this.sessionLogLimit = options.sessionLogLimit ?? DEFAULT_SESSION_LOG_LIMIT;
+    this.persistConnectionState = options.persistConnectionState ?? saveConnectionState;
+    this.ptyService =
+      options.ptyService ??
+      new HostPtyService({
+        allowedRoots: options.hostControl.getConfig().allowedRoots,
+        allowedEnvNames: options.hostControl.getConfig().allowedEnvPassthrough,
+        logger: this.logger,
+        onOutput: (ptyId, data) => {
+          this.emitPtyOutput(ptyId, data);
+        },
+        onExit: (ptyId, exitCode, signal) => {
+          this.emitPtyExit(ptyId, exitCode, signal);
+        },
+      });
   }
 
   public async connectOnce(): Promise<void> {
     const socket = this.webSocketFactory(
       buildTransportUrl(this.options.controlPlaneUrl, this.options.credential.token),
     );
+    this.currentSocket = socket;
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
     let opened = false;
     let closedResolved = false;
+    let disconnectLogged = false;
     let resolveClosed: (() => void) | null = null;
+    const logDisconnect = (
+      level: "warn" | "error",
+      message: string,
+      details?: Record<string, unknown>,
+    ): void => {
+      if (disconnectLogged) {
+        return;
+      }
+      disconnectLogged = true;
+      this.logger[level](AgentEvent.DISCONNECT, message, details);
+    };
     const finishClosed = (): void => {
       if (heartbeatTimer !== null) {
         clearInterval(heartbeatTimer);
@@ -74,6 +145,9 @@ export class NodeAgentLoop {
       }
       if (!closedResolved) {
         closedResolved = true;
+        this.currentSocket = null;
+        this.ptyService.closeAll();
+        this.ptyRequestIds.clear();
         resolveClosed?.();
       }
     };
@@ -84,25 +158,58 @@ export class NodeAgentLoop {
       void this.handleIncomingFrame(socket, event.data);
     };
     socket.onclose = () => {
+      if (opened) {
+        this.updateConnectionState("disconnected");
+        logDisconnect("warn", "transport disconnected", {
+          control_plane_url: this.options.controlPlaneUrl,
+          failure_class: "transport",
+        });
+      }
       finishClosed();
     };
     await new Promise<void>((resolve, reject) => {
       socket.onopen = () => {
         opened = true;
+        this.updateConnectionState("connected");
+        this.logger.info(AgentEvent.CONNECT, "transport connected", {
+          control_plane_url: this.options.controlPlaneUrl,
+        });
         heartbeatTimer = setInterval(() => {
           socket.send(JSON.stringify({ type: "heartbeat", sent_at: new Date().toISOString() }));
         }, this.heartbeatIntervalMs);
         resolve();
       };
       socket.onerror = (event) => {
+        const errorMessage = toErrorMessage(event.error);
         if (!opened) {
+          this.updateConnectionState("disconnected", errorMessage);
+          this.logger.error(getConnectFailureEvent(errorMessage), "transport connection failed", {
+            control_plane_url: this.options.controlPlaneUrl,
+            error: errorMessage,
+            failure_class: "transport",
+          });
           reject(event.error instanceof Error ? event.error : new Error("websocket open failed"));
           return;
         }
+        this.updateConnectionState("disconnected", errorMessage);
+        logDisconnect("error", "transport errored after connect", {
+          control_plane_url: this.options.controlPlaneUrl,
+          error: errorMessage,
+          failure_class: "transport",
+        });
         finishClosed();
       };
     });
     await closed;
+  }
+
+  private updateConnectionState(
+    connectionState: AgentConnectionState,
+    recentError: string | null = null,
+  ): void {
+    void Promise.resolve(this.persistConnectionState(connectionState, recentError)).catch(
+      () => undefined,
+    );
   }
 
   public async start(signal?: AbortSignal): Promise<void> {
@@ -111,8 +218,18 @@ export class NodeAgentLoop {
       try {
         await this.connectOnce();
         delayMs = this.reconnectDelayMs;
-      } catch {
-        await sleep(delayMs);
+      } catch (error: unknown) {
+        if (signal?.aborted) {
+          break;
+        }
+        const scheduledDelayMs = applyJitter(delayMs, this.reconnectJitterRatio, this.random);
+        this.logger.warn(AgentEvent.RECONNECT, "transport reconnect scheduled", {
+          delay_ms: scheduledDelayMs,
+          base_delay_ms: delayMs,
+          error: toErrorMessage(error),
+          failure_class: "transport",
+        });
+        await sleep(scheduledDelayMs, signal);
         delayMs = Math.min(delayMs * 2, this.maxReconnectDelayMs);
       }
     }
@@ -151,25 +268,44 @@ export class NodeAgentLoop {
         try {
           const hostRequest = toHostExecRequest(request.params);
           const sessionId = getTaskPackageSessionId(request.params);
+          let streamChunkClipWarningLogged = false;
           const handle = await this.options.hostControl.exec({
             ...hostRequest,
             onStdout: (chunk): void => {
-              this.appendSessionLog(sessionId, "stdout", chunk);
+              const outputChunk = clipSessionLogChunk(chunk);
+              this.appendSessionLog(sessionId, "stdout", outputChunk.text);
+              if (outputChunk.clipped && !streamChunkClipWarningLogged) {
+                streamChunkClipWarningLogged = true;
+                this.appendSessionLog(
+                  sessionId,
+                  "system",
+                  "output chunk clipped to the session log transport limit",
+                );
+              }
               socket.send(
                 JSON.stringify({
                   type: "event",
                   request_id: request.id,
-                  payload: { event: "output", data: { text: chunk } },
+                  payload: { event: "output", data: { text: outputChunk.text } },
                 }),
               );
             },
             onStderr: (chunk): void => {
-              this.appendSessionLog(sessionId, "stderr", chunk);
+              const outputChunk = clipSessionLogChunk(chunk);
+              this.appendSessionLog(sessionId, "stderr", outputChunk.text);
+              if (outputChunk.clipped && !streamChunkClipWarningLogged) {
+                streamChunkClipWarningLogged = true;
+                this.appendSessionLog(
+                  sessionId,
+                  "system",
+                  "output chunk clipped to the session log transport limit",
+                );
+              }
               socket.send(
                 JSON.stringify({
                   type: "event",
                   request_id: request.id,
-                  payload: { event: "output", data: { text: chunk } },
+                  payload: { event: "output", data: { text: outputChunk.text } },
                 }),
               );
             },
@@ -177,17 +313,13 @@ export class NodeAgentLoop {
           this.activeExecs.set(request.params.job_id, handle);
           const result = await handle.result;
           this.activeExecs.delete(request.params.job_id);
+          this.appendSessionTruncationWarning(sessionId, result);
           return {
             id: request.id,
             result: {
               output_text: result.stdout,
               artifacts: [],
-              meta: {
-                exit_code: result.exitCode,
-                stderr: result.stderr,
-                signal: result.signal,
-                status: result.status,
-              },
+              meta: toExecutionMeta(result),
             },
           };
         } catch (error: unknown) {
@@ -223,7 +355,7 @@ export class NodeAgentLoop {
       case "file_browse":
         return this.handleFileBrowse(request.id, request.params);
       case "pty_open":
-        return this.handlePtyOpen(socket, request.id, request.params);
+        return this.handlePtyOpen(request.id, request.params);
       case "pty_input":
         return this.handlePtyInput(request.id, request.params);
       case "pty_resize":
@@ -237,7 +369,11 @@ export class NodeAgentLoop {
     }
   }
 
-  private appendSessionLog(sessionId: string | undefined, stream: "stdout" | "stderr", message: string): void {
+  private appendSessionLog(
+    sessionId: string | undefined,
+    stream: AgentSessionLogStream,
+    message: string,
+  ): void {
     if (sessionId === undefined) {
       return;
     }
@@ -246,10 +382,16 @@ export class NodeAgentLoop {
       return;
     }
     session.logs.push({
+      cursor: session.nextCursor,
       stream,
       message,
       created_at: new Date().toISOString(),
     });
+    session.nextCursor += 1;
+    const overflow = session.logs.length - this.sessionLogLimit;
+    if (overflow > 0) {
+      session.logs.splice(0, overflow);
+    }
   }
 
   private handleCreateSession(
@@ -264,6 +406,7 @@ export class NodeAgentLoop {
       workspaceId: params.workspace_id,
       createdAt: new Date().toISOString(),
       logs: [],
+      nextCursor: 1,
       status: "ready",
     };
     this.sessions.set(params.session_id, session);
@@ -311,6 +454,7 @@ export class NodeAgentLoop {
     }
     try {
       const argv = [params.command, ...(params.args ?? [])];
+      let streamChunkClipWarningLogged = false;
       const handle = await this.options.hostControl.exec({
         argv,
         cwd: params.cwd,
@@ -318,44 +462,50 @@ export class NodeAgentLoop {
         stdin: params.stdin,
         timeoutMs: params.timeout_ms,
         onStdout: (chunk): void => {
-          session.logs.push({
-            stream: "stdout",
-            message: chunk,
-            created_at: new Date().toISOString(),
-          });
+          const outputChunk = clipSessionLogChunk(chunk);
+          this.appendSessionLog(params.session_id, "stdout", outputChunk.text);
+          if (outputChunk.clipped && !streamChunkClipWarningLogged) {
+            streamChunkClipWarningLogged = true;
+            this.appendSessionLog(
+              params.session_id,
+              "system",
+              "output chunk clipped to the session log transport limit",
+            );
+          }
           socket.send(
             JSON.stringify({
               type: "event",
               request_id: requestId,
-              payload: { event: "output", data: { text: chunk } },
+              payload: { event: "output", data: { text: outputChunk.text } },
             }),
           );
         },
         onStderr: (chunk): void => {
-          session.logs.push({
-            stream: "stderr",
-            message: chunk,
-            created_at: new Date().toISOString(),
-          });
+          const outputChunk = clipSessionLogChunk(chunk);
+          this.appendSessionLog(params.session_id, "stderr", outputChunk.text);
+          if (outputChunk.clipped && !streamChunkClipWarningLogged) {
+            streamChunkClipWarningLogged = true;
+            this.appendSessionLog(
+              params.session_id,
+              "system",
+              "output chunk clipped to the session log transport limit",
+            );
+          }
           socket.send(
             JSON.stringify({
               type: "event",
               request_id: requestId,
-              payload: { event: "output", data: { text: chunk } },
+              payload: { event: "output", data: { text: outputChunk.text } },
             }),
           );
         },
       });
       const result = await handle.result;
+      this.appendSessionTruncationWarning(params.session_id, result);
       return okResult(requestId, {
         output_text: result.stdout,
         artifacts: [],
-        meta: {
-          exit_code: result.exitCode,
-          stderr: result.stderr,
-          signal: result.signal,
-          status: result.status,
-        },
+        meta: toExecutionMeta(result),
       });
     } catch (error: unknown) {
       return errorResult(
@@ -374,17 +524,21 @@ export class NodeAgentLoop {
     if (session === undefined) {
       return errorResult(requestId, "session_not_found", `session ${params.session_id} not found`);
     }
-    const cursorIndex = params.cursor !== undefined ? parseInt(params.cursor, 10) : 0;
+    const cursorIndex = parseLogCursor(params.cursor);
     const limit = params.limit ?? 100;
-    const chunks = session.logs.slice(cursorIndex, cursorIndex + limit).map((log, index) => ({
+    const chunks = session.logs
+      .filter((log) => log.cursor > cursorIndex)
+      .slice(0, limit)
+      .map((log) => ({
       stream: log.stream,
       message: log.message,
-      cursor: String(cursorIndex + index + 1),
+      cursor: String(log.cursor),
       created_at: log.created_at,
-    }));
+      }));
+    const lastReturnedCursor = chunks.at(-1)?.cursor;
     const nextCursor =
-      cursorIndex + chunks.length < session.logs.length
-        ? String(cursorIndex + chunks.length)
+      lastReturnedCursor !== undefined && session.logs.some((log) => log.cursor > Number(lastReturnedCursor))
+        ? lastReturnedCursor
         : undefined;
     return okResult(requestId, {
       output_text: JSON.stringify({ chunks, next_cursor: nextCursor }),
@@ -398,7 +552,7 @@ export class NodeAgentLoop {
     params: { path: string; encoding?: "text" | "base64" },
   ): Promise<RpcResult> {
     if (!this.options.fileService?.isEnabled()) {
-      return errorResult(requestId, "unsupported_capability", "file operations are not enabled");
+      return this.unsupportedCapability(requestId, "file_read", "file operations are not enabled");
     }
     try {
       const result = await this.options.fileService.read(params.path, params.encoding ?? "text");
@@ -426,7 +580,7 @@ export class NodeAgentLoop {
     params: { path: string; content_text?: string; content_base64?: string; overwrite?: boolean },
   ): Promise<RpcResult> {
     if (!this.options.fileService?.isEnabled()) {
-      return errorResult(requestId, "unsupported_capability", "file operations are not enabled");
+      return this.unsupportedCapability(requestId, "file_write", "file operations are not enabled");
     }
     try {
       const result = await this.options.fileService.write(params.path, {
@@ -453,7 +607,11 @@ export class NodeAgentLoop {
     params: { path: string; recursive?: boolean },
   ): Promise<RpcResult> {
     if (!this.options.fileService?.isEnabled()) {
-      return errorResult(requestId, "unsupported_capability", "file operations are not enabled");
+      return this.unsupportedCapability(
+        requestId,
+        "file_delete",
+        "file operations are not enabled",
+      );
     }
     try {
       const result = await this.options.fileService.delete(params.path, params.recursive ?? false);
@@ -476,7 +634,11 @@ export class NodeAgentLoop {
     params: { path?: string; recursive?: boolean },
   ): Promise<RpcResult> {
     if (!this.options.fileService?.isEnabled()) {
-      return errorResult(requestId, "unsupported_capability", "file operations are not enabled");
+      return this.unsupportedCapability(
+        requestId,
+        "file_browse",
+        "file operations are not enabled",
+      );
     }
     try {
       const entries = await this.options.fileService.browse(
@@ -498,7 +660,6 @@ export class NodeAgentLoop {
   }
 
   private handlePtyOpen(
-    socket: WebSocketLike,
     requestId: string,
     params: {
       session_id: string;
@@ -510,11 +671,8 @@ export class NodeAgentLoop {
       cwd?: string;
     },
   ): RpcResult {
-    if (this.options.ptyService === undefined) {
-      return errorResult(requestId, "unsupported_capability", "PTY is not enabled");
-    }
     try {
-      const session = this.options.ptyService.open({
+      const session = this.ptyService.open({
         sessionId: params.session_id,
         cols: params.cols,
         rows: params.rows,
@@ -523,11 +681,7 @@ export class NodeAgentLoop {
         env: params.env,
         cwd: params.cwd,
       });
-      // Wire output events to the socket
-      const originalOnOutput = this.options.ptyService.constructor.name;
-      void originalOnOutput;
-      // PTY output is wired via the HostPtyService constructor onOutput callback,
-      // but we also send event frames for the specific request
+      this.ptyRequestIds.set(session.ptyId, requestId);
       return okResult(requestId, {
         output_text: session.ptyId,
         artifacts: [],
@@ -543,10 +697,7 @@ export class NodeAgentLoop {
   }
 
   private handlePtyInput(requestId: string, params: { pty_id: string; data: string }): RpcResult {
-    if (this.options.ptyService === undefined) {
-      return errorResult(requestId, "unsupported_capability", "PTY is not enabled");
-    }
-    const session = this.options.ptyService.get(params.pty_id);
+    const session = this.ptyService.get(params.pty_id);
     if (session === null) {
       return errorResult(requestId, "pty_not_found", `PTY ${params.pty_id} not found`);
     }
@@ -558,10 +709,7 @@ export class NodeAgentLoop {
     requestId: string,
     params: { pty_id: string; cols: number; rows: number },
   ): RpcResult {
-    if (this.options.ptyService === undefined) {
-      return errorResult(requestId, "unsupported_capability", "PTY is not enabled");
-    }
-    const session = this.options.ptyService.get(params.pty_id);
+    const session = this.ptyService.get(params.pty_id);
     if (session === null) {
       return errorResult(requestId, "pty_not_found", `PTY ${params.pty_id} not found`);
     }
@@ -570,15 +718,59 @@ export class NodeAgentLoop {
   }
 
   private handlePtyClose(requestId: string, params: { pty_id: string }): RpcResult {
-    if (this.options.ptyService === undefined) {
-      return errorResult(requestId, "unsupported_capability", "PTY is not enabled");
-    }
-    const session = this.options.ptyService.get(params.pty_id);
+    const session = this.ptyService.get(params.pty_id);
     if (session === null) {
       return okResult(requestId, { output_text: "closed", artifacts: [], meta: {} });
     }
     session.close();
     return okResult(requestId, { output_text: "closed", artifacts: [], meta: {} });
+  }
+
+  private emitPtyOutput(ptyId: string, data: string): void {
+    const socket = this.currentSocket;
+    const requestId = this.ptyRequestIds.get(ptyId);
+    if (socket === null || requestId === undefined || data.length === 0) {
+      return;
+    }
+    socket.send(
+      JSON.stringify({
+        type: "event",
+        request_id: requestId,
+        payload: {
+          event: "pty_output",
+          data: {
+            pty_id: ptyId,
+            text: data,
+          },
+        },
+      }),
+    );
+  }
+
+  private emitPtyExit(ptyId: string, exitCode: number, signal?: string): void {
+    const socket = this.currentSocket;
+    const requestId = this.ptyRequestIds.get(ptyId);
+    if (requestId === undefined) {
+      return;
+    }
+    this.ptyRequestIds.delete(ptyId);
+    if (socket === null) {
+      return;
+    }
+    socket.send(
+      JSON.stringify({
+        type: "event",
+        request_id: requestId,
+        payload: {
+          event: "pty_exit",
+          data: {
+            pty_id: ptyId,
+            exit_code: exitCode,
+            signal: signal ?? null,
+          },
+        },
+      }),
+    );
   }
 
   private handleServiceLaunch(
@@ -593,7 +785,11 @@ export class NodeAgentLoop {
     },
   ): RpcResult {
     if (this.options.serviceManager === undefined) {
-      return errorResult(requestId, "unsupported_capability", "service launch is not enabled");
+      return this.unsupportedCapability(
+        requestId,
+        "service_launch",
+        "service launch is not enabled",
+      );
     }
     try {
       const service = this.options.serviceManager.launch({
@@ -625,7 +821,11 @@ export class NodeAgentLoop {
 
   private handleServiceStop(requestId: string, params: { service_id: string }): RpcResult {
     if (this.options.serviceManager === undefined) {
-      return errorResult(requestId, "unsupported_capability", "service management is not enabled");
+      return this.unsupportedCapability(
+        requestId,
+        "service_stop",
+        "service management is not enabled",
+      );
     }
     const stopped = this.options.serviceManager.stop(params.service_id);
     return okResult(requestId, {
@@ -633,6 +833,31 @@ export class NodeAgentLoop {
       artifacts: [],
       meta: { service_id: params.service_id, stopped },
     });
+  }
+
+  private unsupportedCapability(requestId: string, method: string, message: string): RpcResult {
+    this.logger.warn(AgentEvent.CAPABILITY_MISMATCH, "request blocked by disabled capability", {
+      method,
+      message,
+      failure_class: "capability_mismatch",
+    });
+    return errorResult(requestId, "unsupported_capability", message);
+  }
+
+  private appendSessionTruncationWarning(
+    sessionId: string | undefined,
+    result: Awaited<HostExecHandle["result"]>,
+  ): void {
+    if (sessionId === undefined || !result.truncated) {
+      return;
+    }
+
+    const warning = buildTruncationWarningMessage(result);
+    if (warning === null) {
+      return;
+    }
+
+    this.appendSessionLog(sessionId, "system", warning);
   }
 }
 
@@ -678,9 +903,114 @@ const toStringRecord = (value: unknown): Record<string, string> | undefined => {
   return entries.length === 0 ? undefined : Object.fromEntries(entries);
 };
 
-const sleep = async (ms: number): Promise<void> => {
-  await new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = async (ms: number, signal?: AbortSignal): Promise<void> => {
+  await new Promise<void>((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    }, ms);
+
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+
+    signal?.addEventListener("abort", finish, { once: true });
+  });
 };
+
+const clipSessionLogChunk = (message: string): { text: string; clipped: boolean } => {
+  const encoded = Buffer.from(message, "utf8");
+  if (encoded.byteLength <= DEFAULT_SESSION_LOG_CHUNK_MAX_BYTES) {
+    return { text: message, clipped: false };
+  }
+
+  return {
+    text: encoded.subarray(0, DEFAULT_SESSION_LOG_CHUNK_MAX_BYTES).toString("utf8"),
+    clipped: true,
+  };
+};
+
+const applyJitter = (delayMs: number, jitterRatio: number, random: () => number): number => {
+  if (delayMs <= 0 || jitterRatio <= 0) {
+    return delayMs;
+  }
+
+  const spread = delayMs * jitterRatio;
+  const minDelay = Math.max(0, delayMs - spread);
+  const maxDelay = delayMs + spread;
+  const jittered = minDelay + (maxDelay - minDelay) * random();
+  return Math.max(1, Math.round(jittered));
+};
+
+const parseLogCursor = (cursor: string | undefined): number => {
+  if (cursor === undefined) {
+    return 0;
+  }
+
+  const parsed = Number.parseInt(cursor, 10);
+  if (Number.isNaN(parsed) || parsed < 0) {
+    return 0;
+  }
+
+  return parsed;
+};
+
+const buildTruncationWarnings = (
+  result: Pick<HostExecRequestResultLike, "stdoutTruncated" | "stderrTruncated">,
+): string[] => {
+  const warnings: string[] = [];
+  if (result.stdoutTruncated) {
+    warnings.push("stdout output was truncated to the configured limit");
+  }
+  if (result.stderrTruncated) {
+    warnings.push("stderr output was truncated to the configured limit");
+  }
+  return warnings;
+};
+
+const buildTruncationWarningMessage = (
+  result: Pick<HostExecRequestResultLike, "stdoutTruncated" | "stderrTruncated">,
+): string | null => {
+  const warnings = buildTruncationWarnings(result);
+  if (warnings.length === 0) {
+    return null;
+  }
+  return `output truncated: ${warnings.join("; ")}`;
+};
+
+const toExecutionMeta = (result: HostExecRequestResultLike): Record<string, unknown> => ({
+  exit_code: result.exitCode,
+  stderr: result.stderr,
+  signal: result.signal,
+  status: result.status,
+  truncated: result.truncated,
+  stdout_truncated: result.stdoutTruncated,
+  stderr_truncated: result.stderrTruncated,
+  truncation_warnings: buildTruncationWarnings(result),
+});
+
+const getConnectFailureEvent = (message: string): string =>
+  /auth|credential|401|403/i.test(message) ? AgentEvent.AUTH_FAIL : AgentEvent.CONNECT;
+
+const toErrorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : "unknown error";
+
+interface HostExecRequestResultLike {
+  readonly exitCode: number | null;
+  readonly stderr: string;
+  readonly signal: string | null;
+  readonly status: string;
+  readonly truncated: boolean;
+  readonly stdoutTruncated: boolean;
+  readonly stderrTruncated: boolean;
+}
 
 interface RpcResult {
   id: string;

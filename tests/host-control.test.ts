@@ -5,6 +5,32 @@ import path from "node:path";
 
 import { HostExecHistoryStore } from "../src/host-control/history.ts";
 import { HostControlService } from "../src/host-control/service.ts";
+import { resolveStoragePaths } from "../src/storage/paths.ts";
+import { createAgentLogger, type LogEntry } from "../src/utils/logger.ts";
+
+const createLogWriter = (): {
+  readonly chunks: string[];
+  readonly writer: Pick<typeof process.stderr, "write">;
+} => {
+  const chunks: string[] = [];
+  return {
+    chunks,
+    writer: {
+      write: (chunk) => {
+        chunks.push(String(chunk));
+        return true;
+      },
+    },
+  };
+};
+
+const parseLogEntries = (chunks: readonly string[]): LogEntry[] =>
+  chunks
+    .join("")
+    .trim()
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line) as LogEntry);
 
 describe("HostControlService", () => {
   test("executes argv-based commands", async () => {
@@ -16,11 +42,41 @@ describe("HostControlService", () => {
     expect(result.stdout).toContain("hello");
   });
 
+  test("emits structured exec lifecycle logs", async () => {
+    const logs = createLogWriter();
+    const service = new HostControlService({
+      maxConcurrentExecs: 1,
+      logger: createAgentLogger(logs.writer),
+    });
+
+    const handle = await service.exec({ argv: ["echo", "logged"] });
+    const result = await handle.result;
+
+    expect(result.status).toBe("completed");
+    const entries = parseLogEntries(logs.chunks);
+    expect(entries.some((entry) => entry.event === "exec.start")).toBe(true);
+    expect(entries.some((entry) => entry.event === "exec.finish")).toBe(true);
+  });
+
   test("rejects cwd outside allowed roots", () => {
     const service = new HostControlService({
       allowedRoots: [path.join(os.tmpdir(), "allowed-root")],
     });
     expect(() => service.exec({ argv: ["pwd"], cwd: "/" })).toThrow(/outside allowed roots/);
+  });
+
+  test("logs cwd path violations clearly", () => {
+    const logs = createLogWriter();
+    const service = new HostControlService({
+      allowedRoots: [path.join(os.tmpdir(), "allowed-root")],
+      logger: createAgentLogger(logs.writer),
+    });
+
+    expect(() => service.exec({ argv: ["pwd"], cwd: "/" })).toThrow(/outside allowed roots/);
+
+    const entries = parseLogEntries(logs.chunks);
+    expect(entries.some((entry) => entry.event === "path.violation")).toBe(true);
+    expect(entries.some((entry) => entry.details?.failure_class === "path_violation")).toBe(true);
   });
 
   test("aborts long-running commands", async () => {
@@ -66,6 +122,22 @@ describe("HostControlService", () => {
     expect(result.status).toBe("completed");
     expect(Buffer.byteLength(result.stdout, "utf8")).toBeLessThanOrEqual(32);
     expect(result.truncated).toBeTrue();
+    expect(result.stdoutTruncated).toBeTrue();
+    expect(result.stderrTruncated).toBeFalse();
+  });
+
+  test("caps oversized stderr output separately", async () => {
+    const service = new HostControlService({ maxStderrBytes: 24, maxConcurrentExecs: 1 });
+    const handle = await service.exec({
+      argv: ["python3", "-c", 'import sys; sys.stderr.write("e" * 128)'],
+    });
+    const result = await handle.result;
+
+    expect(result.status).toBe("completed");
+    expect(Buffer.byteLength(result.stderr, "utf8")).toBeLessThanOrEqual(24);
+    expect(result.truncated).toBeTrue();
+    expect(result.stdoutTruncated).toBeFalse();
+    expect(result.stderrTruncated).toBeTrue();
   });
 
   test("persists recent execution snapshots for restart-safe debugging", async () => {
@@ -80,6 +152,39 @@ describe("HostControlService", () => {
     const snapshots = await history.list();
     expect(snapshots).toHaveLength(1);
     expect(snapshots[0]?.stdoutPreview).toContain("persisted");
+  });
+
+  test("reads legacy execution snapshots without truncation flags", async () => {
+    const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "or3-node-history-legacy-"));
+    process.env.HOME = tempHome;
+    const { dataDir, execHistoryFilePath } = resolveStoragePaths();
+    await fs.mkdir(dataDir, { recursive: true });
+    await fs.writeFile(
+      execHistoryFilePath,
+      `${JSON.stringify([
+        {
+          execId: "hostexec_legacy",
+          argv: ["echo", "legacy"],
+          cwd: null,
+          status: "completed",
+          stdoutPreview: "legacy",
+          stderrPreview: "",
+          startedAt: "2024-01-01T00:00:00.000Z",
+          completedAt: "2024-01-01T00:00:01.000Z",
+          exitCode: 0,
+          signal: null,
+          truncated: false,
+        },
+      ])}\n`,
+      "utf8",
+    );
+
+    const history = new HostExecHistoryStore();
+    const snapshots = await history.list();
+
+    expect(snapshots).toHaveLength(1);
+    expect(snapshots[0]?.stdoutTruncated).toBeFalse();
+    expect(snapshots[0]?.stderrTruncated).toBeFalse();
   });
 
   test("times out runaway commands", async () => {

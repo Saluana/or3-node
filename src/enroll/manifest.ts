@@ -5,6 +5,8 @@ import type { NodeManifest } from "or3-net";
 
 import type { NodeAgentConfig } from "../config/types.ts";
 import type { NodeIdentityRecord } from "../identity/store.ts";
+import { getAdvertisedCapabilityList } from "../runtime-capabilities.ts";
+import { AGENT_VERSION } from "../version.ts";
 
 const DEFAULT_MAX_CONCURRENT_JOBS = 2;
 const DEFAULT_MAX_TTL_SECONDS = 300;
@@ -33,7 +35,7 @@ export const buildSignedManifest = (
       supports_warm_pool: false,
       reset_methods: ["process_kill", "credential_rotation"],
     },
-    version: "0.1.0",
+    version: AGENT_VERSION,
   };
 
   return {
@@ -60,9 +62,5 @@ const buildNodeId = (publicKeyBase64: string, nodeName: string | null): string =
 };
 
 const buildCapabilities = (config: NodeAgentConfig): string[] => {
-  const capabilities = ["exec"];
-  if (config.allowedRoots.length > 0) {
-    capabilities.push("file-read", "file-write");
-  }
-  return capabilities;
+  return getAdvertisedCapabilityList(config);
 };

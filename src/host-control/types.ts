@@ -1,3 +1,5 @@
+import type { AgentLogger } from "../utils/logger.ts";
+
 export type HostExecStatus = "running" | "completed" | "failed" | "aborted" | "timed_out";
 
 export interface HostExecRequest {
@@ -22,6 +24,8 @@ export interface HostExecSnapshot {
   readonly exitCode: number | null;
   readonly signal: string | null;
   readonly truncated: boolean;
+  readonly stdoutTruncated: boolean;
+  readonly stderrTruncated: boolean;
 }
 
 export interface HostExecResult extends HostExecSnapshot {
@@ -45,4 +49,5 @@ export interface HostControlConfig {
   readonly defaultTimeoutMs: number;
   readonly maxTimeoutMs: number;
   readonly onResult?: (result: HostExecResult) => Promise<void> | void;
+  readonly logger?: AgentLogger;
 }

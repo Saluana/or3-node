@@ -9,6 +9,16 @@
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
+export type AgentFailureClass =
+  | "config"
+  | "bootstrap"
+  | "approval"
+  | "credential"
+  | "transport"
+  | "exec"
+  | "capability_mismatch"
+  | "path_violation";
+
 export interface LogEntry {
   readonly level: LogLevel;
   readonly event: string;
@@ -67,8 +77,25 @@ export const createAgentLogger = (
   };
 };
 
+export const createNoopAgentLogger = (): AgentLogger => ({
+  debug: () => {
+    return;
+  },
+  info: () => {
+    return;
+  },
+  warn: () => {
+    return;
+  },
+  error: () => {
+    return;
+  },
+});
+
 // Well-known event names for structured logging across the agent.
 export const AgentEvent = {
+  CONFIG_FAIL: "config.fail",
+
   // Bootstrap & enrollment
   BOOTSTRAP_START: "bootstrap.start",
   BOOTSTRAP_SUCCESS: "bootstrap.success",
@@ -109,6 +136,9 @@ export const AgentEvent = {
   SERVICE_LAUNCH: "service.launch",
   SERVICE_STOP: "service.stop",
   SERVICE_EXIT: "service.exit",
+
+  CAPABILITY_MISMATCH: "capability.mismatch",
+  PATH_VIOLATION: "path.violation",
 
   // Health & info
   HEALTH_CHECK: "health.check",

@@ -43,6 +43,18 @@ export const saveConfig = async (config: NodeAgentConfig): Promise<void> => {
   await fs.writeFile(configFilePath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
 };
 
+export const clearBootstrapToken = async (): Promise<void> => {
+  const config = await loadConfig();
+  if (config.bootstrapToken === null) {
+    return;
+  }
+
+  await saveConfig({
+    ...config,
+    bootstrapToken: null,
+  });
+};
+
 export const loadState = async (): Promise<NodeAgentState> => {
   const { stateFilePath, credentialFilePath } = resolveStoragePaths();
   try {
@@ -106,6 +118,15 @@ export const saveState = async (state: NodeAgentState): Promise<void> => {
     { encoding: "utf8", mode: 0o600 },
   );
   await fs.chmod(credentialFilePath, 0o600);
+};
+
+export const resetState = async (): Promise<void> => {
+  const { stateFilePath, credentialFilePath, connectionStateFilePath } = resolveStoragePaths();
+  await Promise.all([
+    fs.rm(stateFilePath, { force: true }),
+    fs.rm(credentialFilePath, { force: true }),
+    fs.rm(connectionStateFilePath, { force: true }),
+  ]);
 };
 
 const isMissingFileError = (error: unknown): boolean =>

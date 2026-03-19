@@ -19,6 +19,7 @@ or3-node launch
 
 - `or3-node launch`
 - `or3-node doctor`
+- `or3-node info`
 - `or3-node status`
 - `or3-node reset`
 
@@ -71,6 +72,65 @@ The shipped CLI name stays short (`or3-node`) even though the planning docs may 
 - `https` remains available as a dev/fallback transport because it is simpler to debug and useful before a live socket is attached
 - tradeoff: `https` can exercise the same request contract, but it does not provide the same continuously attached session semantics as the connected `outbound-wss` path
 
+## Capability truthfulness
+
+- `exec` is always advertised.
+- `file-read` and `file-write` are only advertised when `allowedRoots` is configured and the default launch path wires `HostFileService`.
+- `pty` is advertised only on Linux and macOS when the Bun Terminal-backed host PTY service is enabled in the default runtime path.
+- `service-launch` remains hidden until the service story is stronger than the current scaffold.
+
+## PTY support
+
+Full PTY support now ships through `src/host-control/pty.ts` and `src/transport/agent-loop.ts`, with regression coverage in `tests/host-control-pty.test.ts` and transport-level PTY tests.
+
+- Linux and macOS use Bun's Terminal API through `Bun.spawn({ terminal: { cols, rows, data, exit, drain } })`.
+- PTY lifecycle uses `proc.terminal.write(...)`, `proc.terminal.resize(...)`, `proc.terminal.setRawMode(...)`, and `proc.terminal.close()`.
+- PTY output and exit stream through the existing `pty_*` RPC path and surface in the OR3 Net runtime-session layer.
+- Windows PTY stays hidden for this phase because Bun's Terminal API is POSIX-only today.
+
+Verification:
+
+- Linux/macOS: confirm `or3-node info` advertises `pty`, then run the PTY smoke and release-validation steps.
+- Windows: confirm `or3-node info` does not advertise `pty` and that PTY open requests fail clearly instead of degrading to pipes.
+
+## Structured logs
+
+`or3-node` writes structured JSON logs to `stderr` for bootstrap, approval, credentials, transport, exec, and enabled host-control flows.
+
+Example success log:
+
+```json
+{
+  "level": "info",
+  "event": "transport.connect",
+  "message": "transport connected",
+  "timestamp": "2026-03-18T00:00:00.000Z",
+  "details": { "control_plane_url": "http://127.0.0.1:3001" }
+}
+```
+
+Example failure log:
+
+```json
+{
+  "level": "error",
+  "event": "path.violation",
+  "message": "host file operation blocked by path policy",
+  "timestamp": "2026-03-18T00:00:01.000Z",
+  "details": {
+    "path": "/tmp/outside.txt",
+    "error": "path is outside allowed roots: /tmp/outside.txt",
+    "failure_class": "path_violation"
+  }
+}
+```
+
+Useful fields:
+
+- `event`: stable lifecycle name like `bootstrap.start`, `credential.refreshed`, or `exec.finish`
+- `message`: short human-readable summary
+- `details.failure_class`: broad failure bucket such as `bootstrap`, `credential`, `transport`, `exec`, `capability_mismatch`, or `path_violation`
+
 ## Development
 
 Install dependencies:
@@ -92,3 +152,11 @@ bun run typecheck
 bun run lint
 bun test
 ```
+
+## Operations docs
+
+- contributor verification: [docs/smoke-test.md](docs/smoke-test.md)
+- service-manager follow-up: [docs/service-management.md](docs/service-management.md)
+- real-life operations and troubleshooting: [docs/operations.md](docs/operations.md)
+- end-to-end release validation: [docs/release-validation.md](docs/release-validation.md)
+- release-readiness checklist: [docs/release-readiness.md](docs/release-readiness.md)

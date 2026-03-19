@@ -1,6 +1,33 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import { HostPtyService } from "../src/host-control/pty.ts";
+import { createAgentLogger, type LogEntry } from "../src/utils/logger.ts";
+
+const PTY_SUPPORTED = process.platform === "linux" || process.platform === "darwin";
+
+const createLogWriter = (): {
+  readonly chunks: string[];
+  readonly writer: Pick<typeof process.stderr, "write">;
+} => {
+  const chunks: string[] = [];
+  return {
+    chunks,
+    writer: {
+      write: (chunk) => {
+        chunks.push(String(chunk));
+        return true;
+      },
+    },
+  };
+};
+
+const parseLogEntries = (chunks: readonly string[]): LogEntry[] =>
+  chunks
+    .join("")
+    .trim()
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line) as LogEntry);
 
 describe("HostPtyService", () => {
   let service: HostPtyService;
@@ -15,13 +42,17 @@ describe("HostPtyService", () => {
     if (service) service.closeAll();
   });
 
-  test("isSupported returns true on linux/darwin", () => {
+  test("isSupported reflects the current platform", () => {
     service = new HostPtyService();
-    // Test is running on one of these platforms in CI/dev
-    expect(service.isSupported()).toBe(true);
+    expect(service.isSupported()).toBe(PTY_SUPPORTED);
   });
 
   test("open creates a session and list returns it", () => {
+    if (!PTY_SUPPORTED) {
+      service = new HostPtyService();
+      expect(() => service.open({ sessionId: "sess_1" })).toThrow("PTY is not supported");
+      return;
+    }
     const outputs: string[] = [];
     service = new HostPtyService({
       onOutput: (_id, data) => outputs.push(data),
@@ -33,6 +64,9 @@ describe("HostPtyService", () => {
   });
 
   test("get retrieves session by id", () => {
+    if (!PTY_SUPPORTED) {
+      return;
+    }
     service = new HostPtyService();
     const session = service.open({ sessionId: "sess_1" });
     expect(service.get(session.ptyId)).not.toBeNull();
@@ -40,6 +74,9 @@ describe("HostPtyService", () => {
   });
 
   test("write sends data to stdin", async () => {
+    if (!PTY_SUPPORTED) {
+      return;
+    }
     const outputs: string[] = [];
     service = new HostPtyService({
       onOutput: (_id, data) => outputs.push(data),
@@ -65,6 +102,9 @@ describe("HostPtyService", () => {
   });
 
   test("close terminates the session", () => {
+    if (!PTY_SUPPORTED) {
+      return;
+    }
     service = new HostPtyService();
     const session = service.open({ sessionId: "sess_1" });
     session.close();
@@ -72,6 +112,9 @@ describe("HostPtyService", () => {
   });
 
   test("closeAll terminates all sessions", () => {
+    if (!PTY_SUPPORTED) {
+      return;
+    }
     service = new HostPtyService({ maxConcurrentPtys: 10 });
     service.open({ sessionId: "sess_1" });
     service.open({ sessionId: "sess_2" });
@@ -81,12 +124,18 @@ describe("HostPtyService", () => {
   });
 
   test("max concurrent PTY sessions enforced", () => {
+    if (!PTY_SUPPORTED) {
+      return;
+    }
     service = new HostPtyService({ maxConcurrentPtys: 1 });
     service.open({ sessionId: "sess_1" });
     expect(() => service.open({ sessionId: "sess_2" })).toThrow("too many concurrent PTY sessions");
   });
 
   test("resize is callable without error", () => {
+    if (!PTY_SUPPORTED) {
+      return;
+    }
     service = new HostPtyService();
     const session = service.open({ sessionId: "sess_1" });
     // resize is a no-op with pipe-based stdio but should not throw
@@ -96,6 +145,9 @@ describe("HostPtyService", () => {
   });
 
   test("onExit callback fires when process terminates", async () => {
+    if (!PTY_SUPPORTED) {
+      return;
+    }
     let exitPtyId = "";
     let exitCode = -999;
     service = new HostPtyService({
@@ -122,5 +174,80 @@ describe("HostPtyService", () => {
     });
     expect(exitPtyId).toBe(session.ptyId);
     expect(exitCode).toBe(0);
+  });
+
+  test("emits structured PTY lifecycle logs", async () => {
+    if (!PTY_SUPPORTED) {
+      return;
+    }
+    const logs = createLogWriter();
+    let exitCode = -999;
+    service = new HostPtyService({
+      logger: createAgentLogger(logs.writer),
+      onExit: (_ptyId, code) => {
+        exitCode = code;
+      },
+    });
+    service.open({ sessionId: "sess_logs", command: "true" });
+
+    await new Promise<void>((resolve) => {
+      const check = (): void => {
+        if (exitCode !== -999) {
+          resolve();
+        } else {
+          setTimeout(check, 50);
+        }
+      };
+      setTimeout(check, 50);
+    });
+
+    const entries = parseLogEntries(logs.chunks);
+    expect(entries.some((entry) => entry.event === "pty.open")).toBe(true);
+    expect(entries.some((entry) => entry.event === "pty.exit")).toBe(true);
+  });
+
+  test("rejects PTY env vars outside the allowlist", () => {
+    if (!PTY_SUPPORTED) {
+      return;
+    }
+    service = new HostPtyService({ allowedEnvNames: [] });
+    expect(() =>
+      service.open({
+        sessionId: "sess_env_blocked",
+        command: "cat",
+        env: { AWS_SECRET_ACCESS_KEY: "blocked" },
+      }),
+    ).toThrow("env vars are outside allowlist");
+  });
+
+  test("allows PTY env vars that are explicitly allowlisted", async () => {
+    if (!PTY_SUPPORTED) {
+      return;
+    }
+    const outputs: string[] = [];
+    service = new HostPtyService({
+      allowedEnvNames: ["ALLOWED_NAME"],
+      onOutput: (_id, data) => outputs.push(data),
+    });
+    const session = service.open({
+      sessionId: "sess_env_allowed",
+      command: "/bin/sh",
+      args: ["-c", 'printf "%s\\n" "$ALLOWED_NAME"'],
+      env: { ALLOWED_NAME: "ok" },
+    });
+
+    await new Promise<void>((resolve) => {
+      const check = (): void => {
+        if (outputs.some((entry) => entry.includes("ok"))) {
+          resolve();
+        } else {
+          setTimeout(check, 50);
+        }
+      };
+      setTimeout(check, 50);
+    });
+
+    expect(outputs.some((entry) => entry.includes("ok"))).toBe(true);
+    session.close();
   });
 });
