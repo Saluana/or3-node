@@ -55,8 +55,11 @@ const canonicalizeAllowedRoot = (targetPath: string): string => {
   }
 };
 
-const isMissingPathError = (error: unknown): boolean =>
-  error instanceof Error && "code" in error && error.code === "ENOENT";
+const isMissingPathError = (error: unknown): boolean => getErrorCode(error) === "ENOENT";
 
-const isPermissionError = (error: unknown): boolean =>
-  error instanceof Error && "code" in error && error.code === "EACCES";
+const isPermissionError = (error: unknown): boolean => getErrorCode(error) === "EACCES";
+
+const getErrorCode = (error: unknown): string | undefined =>
+  error instanceof Error && "code" in error && typeof error.code === "string"
+    ? error.code
+    : undefined;

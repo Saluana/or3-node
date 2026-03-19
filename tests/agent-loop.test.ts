@@ -680,11 +680,7 @@ describe("node agent loop", () => {
     socket.close();
     await run;
 
-    const frames = socket.outbound.map((payload) => JSON.parse(payload) as {
-      type?: string;
-      request_id?: string;
-      payload?: { event?: string; data?: { text?: string }; id?: string; result?: { meta?: Record<string, unknown> } };
-    });
+    const frames = socket.outbound.map((payload) => JSON.parse(payload) as SocketFrame);
     const outputEvents = frames.filter(
       (frame) => frame.type === "event" && frame.request_id === "req-session-utf8",
     );
