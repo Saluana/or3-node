@@ -179,7 +179,7 @@ export class HostFileService {
     if (!(await this.isWithinAllowedRoots(canonicalPath))) {
       throw new ConfigError(`path is outside allowed roots: ${resolved}`);
     }
-    return resolved;
+    return canonicalPath;
   }
 
   private async resolveDefaultRoot(): Promise<string> {
@@ -254,7 +254,12 @@ export class HostFileService {
             size_bytes: stat.size,
             modified_at: stat.mtime.toISOString(),
           });
-        } catch {
+        } catch (error: unknown) {
+          this.logger.warn(AgentEvent.FILE_BROWSE, "host file browse entry metadata unavailable", {
+            path: fullPath,
+            error: toErrorMessage(error),
+            failure_class: "config",
+          });
           entries.push({ path: fullPath, kind: "file" });
         }
       }

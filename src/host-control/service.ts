@@ -14,6 +14,7 @@ import type {
 import { validateRequestedEnv } from "./env-policy.ts";
 import { resolveAllowedWorkingDirectory } from "./paths.ts";
 import { ConfigError } from "../utils/errors.ts";
+import { truncateUtf8 } from "../utils/utf8.ts";
 import { AgentEvent, createNoopAgentLogger, type AgentLogger } from "../utils/logger.ts";
 
 const DEFAULT_CONFIG: HostControlConfig = {
@@ -348,7 +349,7 @@ const appendBounded = (
   }
 
   return {
-    value: nextBuffer.subarray(0, maxBytes).toString("utf8"),
+    value: truncateUtf8(nextValue, maxBytes),
     truncated: true,
   };
 };

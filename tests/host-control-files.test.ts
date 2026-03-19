@@ -250,6 +250,19 @@ describe("HostFileService", () => {
     );
   });
 
+  test("returns canonical file paths after resolving allowed symlinks", async () => {
+    const service = new HostFileService({ allowedRoots: [tmpDir] });
+    const canonicalPath = path.join(tmpDir, "target.txt");
+    const symlinkPath = path.join(tmpDir, "link.txt");
+    await fs.writeFile(canonicalPath, "hello");
+    await fs.symlink(canonicalPath, symlinkPath);
+
+    const result = await service.read(symlinkPath, "text");
+
+    expect(result.path).toBe(canonicalPath);
+    expect(result.content_text).toBe("hello");
+  });
+
   test("browse defaults to first allowed root when no path provided", async () => {
     const service = new HostFileService({ allowedRoots: [tmpDir] });
     await service.write(path.join(tmpDir, "root.txt"), { content_text: "root" });

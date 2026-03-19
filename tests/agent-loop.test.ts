@@ -310,6 +310,54 @@ describe("node agent loop", () => {
     expect(entries.filter((entry) => entry.event === "transport.disconnect")).toHaveLength(1);
   });
 
+  test("logs and ignores malformed inbound frames", async () => {
+    const socket = new FakeSocket();
+    const logs = createLogWriter();
+    const loop = new NodeAgentLoop({
+      controlPlaneUrl: "http://or3.test",
+      credential: { token: "or3n_live", expiresAt: "2099-01-01T00:00:00.000Z" },
+      hostControl: new HostControlService(),
+      logger: createAgentLogger(logs.writer),
+      webSocketFactory: () => socket,
+      reconnectDelayMs: 1,
+      maxReconnectDelayMs: 1,
+    });
+
+    const run = loop.connectOnce();
+    socket.pushInbound("{ definitely not valid json");
+    await Bun.sleep(20);
+    socket.close();
+    await run;
+
+    const entries = parseLogEntries(logs.chunks);
+    expect(entries.some((entry) => entry.event === "transport.frame_invalid")).toBe(true);
+  });
+
+  test("preserves secure websocket URLs when already configured", async () => {
+    const requestedUrls: string[] = [];
+    const socket = new FakeSocket();
+    const loop = new NodeAgentLoop({
+      controlPlaneUrl: "wss://or3.test/base",
+      credential: { token: "or3n_live", expiresAt: "2099-01-01T00:00:00.000Z" },
+      hostControl: new HostControlService(),
+      webSocketFactory: (url) => {
+        requestedUrls.push(url);
+        return socket;
+      },
+      reconnectDelayMs: 1,
+      maxReconnectDelayMs: 1,
+    });
+
+    const run = loop.connectOnce();
+    await Bun.sleep(20);
+    socket.close();
+    await run;
+
+    expect(requestedUrls).toHaveLength(1);
+    expect(requestedUrls[0]?.startsWith("wss://")).toBe(true);
+    expect(requestedUrls[0]).toContain("/v1/nodes/connect");
+  });
+
   test("logs capability mismatch when file operations are disabled", async () => {
     const socket = new FakeSocket();
     const logs = createLogWriter();
@@ -566,6 +614,87 @@ describe("node agent loop", () => {
           chunk.stream === "system" && chunk.message.includes("session log transport limit"),
       ),
     ).toBe(true);
+  });
+
+  test("clips session log chunks on UTF-8 character boundaries", async () => {
+    const socket = new FakeSocket();
+    const emoji = "😀";
+    const loop = new NodeAgentLoop({
+      controlPlaneUrl: "http://or3.test",
+      credential: { token: "or3n_live", expiresAt: "2099-01-01T00:00:00.000Z" },
+      hostControl: new HostControlService({ maxStdoutBytes: 64 * 1024, maxConcurrentExecs: 1 }),
+      webSocketFactory: () => socket,
+      reconnectDelayMs: 1,
+      maxReconnectDelayMs: 1,
+      sessionLogLimit: 10,
+    });
+
+    const run = loop.connectOnce();
+    socket.pushInbound(
+      JSON.stringify({
+        type: "request",
+        payload: {
+          id: "req-create-session-utf8",
+          method: "create_session",
+          params: { session_id: "sess_utf8", workspace_id: "ws_test" },
+        },
+      }),
+    );
+    await Bun.sleep(10);
+    socket.pushInbound(
+      JSON.stringify({
+        type: "request",
+        payload: {
+          id: "req-session-utf8",
+          method: "session_exec",
+          params: {
+            session_id: "sess_utf8",
+            command: "python3",
+            args: [
+              "-c",
+              `import sys; sys.stdout.write(${JSON.stringify(emoji.repeat(2050))})`,
+            ],
+          },
+        },
+      }),
+    );
+    await Bun.sleep(80);
+    socket.pushInbound(
+      JSON.stringify({
+        type: "request",
+        payload: {
+          id: "req-get-logs-utf8",
+          method: "get_logs",
+          params: { session_id: "sess_utf8" },
+        },
+      }),
+    );
+    await Bun.sleep(20);
+    socket.close();
+    await run;
+
+    const frames = socket.outbound.map((payload) => JSON.parse(payload) as {
+      type?: string;
+      request_id?: string;
+      payload?: { event?: string; data?: { text?: string }; id?: string; result?: { meta?: Record<string, unknown> } };
+    });
+    const outputEvents = frames.filter(
+      (frame) => frame.type === "event" && frame.request_id === "req-session-utf8",
+    );
+    expect(outputEvents.length).toBeGreaterThan(0);
+    expect(outputEvents.every((frame) => !(frame.payload?.data?.text ?? "").includes("�"))).toBe(
+      true,
+    );
+
+    const getLogsResponse = frames.find((frame) => frame.payload?.id === "req-get-logs-utf8");
+    const chunks = (getLogsResponse?.payload?.result?.meta?.chunks ?? []) as {
+      stream: string;
+      message: string;
+    }[];
+    const stdoutChunk = chunks.find((chunk) => chunk.stream === "stdout");
+    expect(stdoutChunk).toBeDefined();
+    expect(stdoutChunk?.message.includes("�")).toBe(false);
+    expect(Buffer.byteLength(stdoutChunk?.message ?? "", "utf8")).toBeLessThanOrEqual(8 * 1024);
   });
 
   test("does not retain in-memory sessions across agent loop restart", async () => {

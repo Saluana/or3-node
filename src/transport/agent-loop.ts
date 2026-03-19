@@ -10,6 +10,7 @@ import {
   saveConnectionState,
   type AgentConnectionState,
 } from "../info/connection-state.ts";
+import { truncateUtf8 } from "../utils/utf8.ts";
 import { AgentEvent, createNoopAgentLogger, type AgentLogger } from "../utils/logger.ts";
 
 export interface AgentLoopCredential {
@@ -155,7 +156,12 @@ export class NodeAgentLoop {
       resolveClosed = resolve;
     });
     socket.onmessage = (event) => {
-      void this.handleIncomingFrame(socket, event.data);
+      void this.handleIncomingFrame(socket, event.data).catch((error: unknown) => {
+        this.logger.warn(AgentEvent.FRAME_INVALID, "transport received invalid frame", {
+          error: toErrorMessage(error),
+          failure_class: "transport",
+        });
+      });
     };
     socket.onclose = () => {
       if (opened) {
@@ -863,7 +869,8 @@ export class NodeAgentLoop {
 
 const buildTransportUrl = (baseUrl: string, token: string): string => {
   const url = new URL("/v1/nodes/connect", baseUrl);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.protocol =
+    url.protocol === "https:" || url.protocol === "wss:" ? "wss:" : "ws:";
   url.searchParams.set("token", token);
   return url.toString();
 };
@@ -932,7 +939,7 @@ const clipSessionLogChunk = (message: string): { text: string; clipped: boolean 
   }
 
   return {
-    text: encoded.subarray(0, DEFAULT_SESSION_LOG_CHUNK_MAX_BYTES).toString("utf8"),
+    text: truncateUtf8(message, DEFAULT_SESSION_LOG_CHUNK_MAX_BYTES),
     clipped: true,
   };
 };
