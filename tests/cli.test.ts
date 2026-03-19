@@ -150,6 +150,10 @@ describe("or3-node cli", () => {
   });
 
   test("launch stores config and identity with owner-only permissions", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+
     const exitCode = await runCli(
       ["launch", "--url", "http://or3.test", "--token", "bootstrap-123"],
       {

@@ -28,7 +28,17 @@ export const resolveAllowedWorkingDirectory = (
   return resolvedPath;
 };
 
-const canonicalizePath = (targetPath: string): string => realpathSync(path.resolve(targetPath));
+const canonicalizePath = (targetPath: string): string => {
+  const resolvedPath = path.resolve(targetPath);
+  try {
+    return realpathSync(resolvedPath);
+  } catch (error: unknown) {
+    if (isMissingPathError(error) || isPermissionError(error)) {
+      throw new ConfigError(`cwd could not be resolved: ${resolvedPath}`);
+    }
+    throw error;
+  }
+};
 
 const canonicalizeAllowedRoot = (targetPath: string): string => {
   const resolvedPath = path.resolve(targetPath);
@@ -44,3 +54,6 @@ const canonicalizeAllowedRoot = (targetPath: string): string => {
 
 const isMissingPathError = (error: unknown): boolean =>
   error instanceof Error && "code" in error && error.code === "ENOENT";
+
+const isPermissionError = (error: unknown): boolean =>
+  error instanceof Error && "code" in error && error.code === "EACCES";
