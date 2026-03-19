@@ -28,7 +28,7 @@ const parseLogEntries = (chunks: readonly string[]): LogEntry[] =>
     .filter((line) => line.length > 0)
     .map((line) => JSON.parse(line) as LogEntry);
 
-type SocketFrame = {
+interface SocketFrame {
   type?: string;
   request_id?: string;
   payload?: {
@@ -37,6 +37,19 @@ type SocketFrame = {
     id?: string;
     result?: { meta?: Record<string, unknown> };
   };
+}
+
+const waitFor = async (
+  predicate: () => boolean,
+  timeoutMs = 1_000,
+): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) {
+      throw new Error(`condition not met within ${String(timeoutMs)}ms`);
+    }
+    await Bun.sleep(10);
+  }
 };
 
 class FakeSocket {
@@ -433,11 +446,12 @@ describe("node agent loop", () => {
     await Bun.sleep(10);
 
     for (let index = 0; index < 5; index += 1) {
+      const requestId = `req-session-exec-${String(index)}`;
       socket.pushInbound(
         JSON.stringify({
           type: "request",
           payload: {
-            id: `req-session-exec-${String(index)}`,
+            id: requestId,
             method: "session_exec",
             params: {
               session_id: "sess_trim",
@@ -447,7 +461,7 @@ describe("node agent loop", () => {
           },
         }),
       );
-      await Bun.sleep(20);
+      await waitFor(() => socket.outbound.some((payload) => payload.includes(requestId)));
     }
     socket.pushInbound(
       JSON.stringify({
@@ -459,7 +473,7 @@ describe("node agent loop", () => {
         },
       }),
     );
-    await Bun.sleep(20);
+    await waitFor(() => socket.outbound.some((payload) => payload.includes("req-get-logs")));
     socket.close();
     await run;
 

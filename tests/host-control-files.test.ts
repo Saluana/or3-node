@@ -67,8 +67,9 @@ describe("HostFileService", () => {
     const service = new HostFileService({ allowedRoots: [tmpDir] });
     const filePath = path.join(tmpDir, "hello.txt");
     const written = await service.write(filePath, { content_text: "hello world" });
+    const expectedPath = await fs.realpath(filePath);
     expect(written.bytes_transferred).toBeGreaterThan(0);
-    expect(written.path).toBe(filePath);
+    expect(written.path).toBe(expectedPath);
 
     const read = await service.read(filePath, "text");
     expect(read.content_text).toBe("hello world");
@@ -258,8 +259,9 @@ describe("HostFileService", () => {
     await fs.symlink(canonicalPath, symlinkPath);
 
     const result = await service.read(symlinkPath, "text");
+    const expectedCanonicalPath = await fs.realpath(canonicalPath);
 
-    expect(result.path).toBe(canonicalPath);
+    expect(result.path).toBe(expectedCanonicalPath);
     expect(result.content_text).toBe("hello");
   });
 
