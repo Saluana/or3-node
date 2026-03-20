@@ -4,6 +4,14 @@
 After that works, the next operational step is usually to run the agent as a
 machine-managed background service.
 
+This document is intentionally a **follow-up** guide. The primary v1 packaging
+story is still:
+
+```bash
+bun install -g or3-node
+or3-node launch
+```
+
 Today, the safest service command is still the foreground runtime:
 
 ```bash
@@ -15,10 +23,11 @@ logging inside the same path contributors already test interactively.
 
 ## Recommended rollout order
 
-1. Verify the node works interactively with `or3-node launch`.
-2. Confirm approval, credential issuance, and a successful remote command.
-3. Run `or3-node launch --foreground --no-interactive` manually once.
-4. Only then install a service wrapper around that exact foreground command.
+1. Install with `bun install -g or3-node` and verify `or3-node --help`.
+2. Verify the node works interactively with `or3-node launch`.
+3. Confirm approval, credential issuance, and a successful remote command.
+4. Run `or3-node launch --foreground --no-interactive` manually once.
+5. Only then install a service wrapper around that exact foreground command.
 
 ## `systemd` (Linux)
 

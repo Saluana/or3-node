@@ -11,6 +11,7 @@ This validation pass is intentionally practical rather than fully automated.
 
 It combines:
 
+- the staged gate runner in [release-gates.md](release-gates.md)
 - the contributor verification flow in [smoke-test.md](smoke-test.md)
 - live foreground execution for transport visibility
 - one abort exercise
@@ -40,14 +41,20 @@ Expected result:
 ## 2. Install and help surface
 
 ```bash
-bun install
-bun run index.ts --help
+bun install -g /absolute/path/to/or3-node
+or3-node --help
 ```
 
 Expected result:
 
-- install succeeds
+- global Bun install succeeds
 - help output lists `launch`, `doctor`, `info`, `status`, and `reset`
+
+Before continuing, run the staged automated gates:
+
+```bash
+bun run validate:release
+```
 
 ## 3. Enroll and launch
 
@@ -174,6 +181,7 @@ Expected result:
 
 ## Signoff checklist
 
+- staged automated gates pass
 - install path works
 - launch path works
 - approval path works

@@ -30,7 +30,7 @@ Expected result:
 ## 1. Install
 
 ```bash
-bun install -g or3-node
+bun install -g /absolute/path/to/or3-node
 ```
 
 Verify installation:
@@ -42,6 +42,12 @@ or3-node --help
 Expected result:
 
 - help output lists `launch`, `doctor`, `info`, `status`, and `reset`
+
+Optional scripted version on a real machine:
+
+```bash
+bun run smoke:real-machine -- --help
+```
 
 ## 2. System Info
 
@@ -162,14 +168,14 @@ Through the runtime session API:
 
 ```bash
 # Create a session
-curl -X POST http://localhost:3100/v1/workspaces/ws_xxx/runtime/remote-node-agent/sessions \
-  -H 'Authorization: Bearer <admin-token>' \
+curl -X POST http://localhost:3100/v1/workspaces/ws_xxx/runtime-sessions \
+  -H 'Authorization: Bearer <runtime-token>' \
   -H 'Content-Type: application/json' \
-  -d '{"config": {"workspace_mode": "none", "network_policy": {"internet_access": false, "ingress": "none"}, "resource_hints": {"metadata": {}}, "persistence_mode": "ephemeral", "env_refs": [], "secret_refs": [], "timeout_rules": {}, "artifact_rules": {"capture_paths": [], "push_on_completion": false, "metadata": {}}}}'
+  -d '{"adapter_id": "remote-node-agent", "workspace_mode": "none", "network_policy": {"internet_access": false, "ingress": "none"}, "resource_hints": {"metadata": {}}, "persistence_mode": "ephemeral", "env_refs": [], "secret_refs": [], "timeout_rules": {}, "artifact_rules": {"capture_paths": [], "push_on_completion": false, "metadata": {}}}'
 
 # Execute within the session
-curl -X POST http://localhost:3100/v1/workspaces/ws_xxx/runtime/remote-node-agent/sessions/<session-ref>/exec \
-  -H 'Authorization: Bearer <admin-token>' \
+curl -X POST http://localhost:3100/v1/workspaces/ws_xxx/runtime-sessions/<session-id>/exec \
+  -H 'Authorization: Bearer <runtime-token>' \
   -H 'Content-Type: application/json' \
   -d '{"command": "echo", "args": ["hello from remote node"], "env": {}, "background": false}'
 ```
@@ -179,6 +185,8 @@ Expected result:
 - stdout contains `hello from remote node`
 - the node remains healthy after execution
 - structured logs show execution lifecycle events locally
+
+Use a token that can create and execute runtime sessions in the target workspace. The explicit `adapter_id` ensures this check validates the remote-node path instead of another available runtime adapter.
 
 ## 9. Contributor verification checklist
 
@@ -192,7 +200,28 @@ Treat the run as complete when all of these are true:
 - one remote command executes successfully
 - `or3-node reset` returns the machine to a clean local state
 
-## 10. Cleanup
+## 10. Real-machine smoke helper
+
+For a more repeatable operator validation pass on a dedicated machine, use:
+
+```bash
+bun run smoke:real-machine -- \
+  --install-global \
+  --reset-first \
+  --cleanup \
+  --control-plane-url http://localhost:3100 \
+  --workspace-id ws_xxx \
+  --admin-token <admin-token>
+```
+
+This Bun helper script proves:
+
+- global Bun install
+- `or3-node launch`
+- approval handoff
+- first remote command over the live control plane
+
+## 11. Cleanup
 
 ```bash
 or3-node reset
@@ -201,7 +230,7 @@ or3-node reset
 If you used a service manager for local testing, stop and disable that service
 before the next verification cycle.
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 | Symptom                   | Check                                               |
 | ------------------------- | --------------------------------------------------- |
