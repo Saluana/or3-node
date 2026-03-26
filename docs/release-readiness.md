@@ -2,6 +2,12 @@
 
 Use this as the short Day 7 release-confidence checklist.
 
+Primary automated entrypoint:
+
+```bash
+bun run validate:release
+```
+
 ## Core behavior
 
 - `launch` enrolls and starts the agent loop when valid credentials exist
@@ -40,6 +46,8 @@ Use this as the short Day 7 release-confidence checklist.
 ## Docs and handoff
 
 - contributor verification guide is current
+- platform support and packaging matrix is current
+- staged release-gate document is current
 - service-manager guide is current
 - operations and troubleshooting guide is current
 - release validation pass is current
@@ -48,6 +56,7 @@ Use this as the short Day 7 release-confidence checklist.
 
 Ship only if:
 
+- `bun run validate:release` is green for the intended release stages
 - the Day 7 validation pass succeeds end-to-end
 - no known truthfulness mismatch remains in CLI or docs
 - current PTY platform limits and service limitations are documented, not implied away

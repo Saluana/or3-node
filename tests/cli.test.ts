@@ -149,6 +149,28 @@ describe("or3-node cli", () => {
     expect(await fs.readFile(statePath, "utf8")).toContain("devbox-abc123");
   });
 
+  test("launch stores config and identity with owner-only permissions", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+
+    const exitCode = await runCli(
+      ["launch", "--url", "http://or3.test", "--token", "bootstrap-123"],
+      {
+        fetch: () => Promise.resolve(pendingBootstrapResponse("node-secure-abc123")),
+        stdout: { write: () => true },
+        stderr: { write: () => true },
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    const { configFilePath, identityFilePath } = resolveStoragePaths();
+    const configStat = await fs.stat(configFilePath);
+    const identityStat = await fs.stat(identityFilePath);
+    expect(configStat.mode & 0o777).toBe(0o600);
+    expect(identityStat.mode & 0o777).toBe(0o600);
+  });
+
   test("launch emits structured bootstrap, approval, and credential logs", async () => {
     const stderr = createWriter();
 

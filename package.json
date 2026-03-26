@@ -9,6 +9,8 @@
   "module": "index.ts",
   "scripts": {
     "lint": "bunx eslint . --max-warnings 0",
+    "smoke:real-machine": "bun ./scripts/real-machine-smoke.ts",
+    "validate:release": "bun ./scripts/release-gates.ts",
     "typecheck": "bunx tsc --noEmit",
     "test": "bun test"
   },

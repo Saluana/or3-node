@@ -15,6 +15,8 @@ bun install -g or3-node
 or3-node launch
 ```
 
+The Bun global install path is the primary v1 packaging story. Service managers are follow-up wrappers around the foreground launch path, not the primary onboarding flow.
+
 ## Current command surface
 
 - `or3-node launch`
@@ -64,6 +66,7 @@ The shipped CLI name stays short (`or3-node`) even though the planning docs may 
 
 - first milestone scope: job execution first, then remote runtime-session support
 - hostile multi-tenant isolation is out of scope
+- host mode is trusted-machine control, not hostile-code isolation
 - the agent should reuse existing `or3-net` node and runtime-session seams instead of forcing a new public API family
 
 ## Transport notes
@@ -151,11 +154,26 @@ Validate:
 bun run typecheck
 bun run lint
 bun test
+bun run validate:release -- --dry-run
+```
+
+Release-gate runner:
+
+```bash
+bun run validate:release
+```
+
+Real-machine smoke:
+
+```bash
+bun run smoke:real-machine -- --help
 ```
 
 ## Operations docs
 
 - contributor verification: [docs/smoke-test.md](docs/smoke-test.md)
+- platform matrix and packaging stance: [docs/platform-support.md](docs/platform-support.md)
+- staged release gates: [docs/release-gates.md](docs/release-gates.md)
 - service-manager follow-up: [docs/service-management.md](docs/service-management.md)
 - real-life operations and troubleshooting: [docs/operations.md](docs/operations.md)
 - end-to-end release validation: [docs/release-validation.md](docs/release-validation.md)

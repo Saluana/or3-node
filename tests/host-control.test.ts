@@ -79,6 +79,25 @@ describe("HostControlService", () => {
     expect(entries.some((entry) => entry.details?.failure_class === "path_violation")).toBe(true);
   });
 
+  test("rejects cwd symlinks that escape the allowed root", async () => {
+    const allowedRoot = await fs.mkdtemp(path.join(os.tmpdir(), "or3-allowed-root-"));
+    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), "or3-outside-root-"));
+    const escapedLink = path.join(allowedRoot, "escaped");
+    await fs.symlink(outsideRoot, escapedLink);
+
+    try {
+      const service = new HostControlService({
+        allowedRoots: [allowedRoot],
+      });
+      expect(() => service.exec({ argv: ["pwd"], cwd: escapedLink })).toThrow(
+        /outside allowed roots/,
+      );
+    } finally {
+      await fs.rm(allowedRoot, { recursive: true, force: true });
+      await fs.rm(outsideRoot, { recursive: true, force: true });
+    }
+  });
+
   test("aborts long-running commands", async () => {
     const service = new HostControlService({ maxConcurrentExecs: 1 });
     const handle = await service.exec({ argv: ["sleep", "5"], timeoutMs: 5_000 });
@@ -138,6 +157,20 @@ describe("HostControlService", () => {
     expect(result.truncated).toBeTrue();
     expect(result.stdoutTruncated).toBeFalse();
     expect(result.stderrTruncated).toBeTrue();
+  });
+
+  test("truncates stdout on UTF-8 character boundaries", async () => {
+    const emoji = "😀";
+    const service = new HostControlService({ maxStdoutBytes: 10, maxConcurrentExecs: 1 });
+    const handle = await service.exec({
+      argv: ["python3", "-c", `import sys; sys.stdout.write(${JSON.stringify(emoji.repeat(3))})`],
+    });
+    const result = await handle.result;
+
+    expect(result.status).toBe("completed");
+    expect(Buffer.byteLength(result.stdout, "utf8")).toBeLessThanOrEqual(10);
+    expect(result.stdout).toBe(emoji.repeat(2));
+    expect(result.stdout).not.toContain("�");
   });
 
   test("persists recent execution snapshots for restart-safe debugging", async () => {

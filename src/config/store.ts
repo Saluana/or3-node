@@ -40,7 +40,11 @@ export const loadConfig = async (): Promise<NodeAgentConfig> => {
 export const saveConfig = async (config: NodeAgentConfig): Promise<void> => {
   const { configDir, configFilePath } = resolveStoragePaths();
   await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(configFilePath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+  await fs.writeFile(configFilePath, `${JSON.stringify(config, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  await fs.chmod(configFilePath, 0o600);
 };
 
 export const clearBootstrapToken = async (): Promise<void> => {

@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import path from "node:path";
 
 import { ConfigError } from "../utils/errors.ts";
@@ -10,14 +11,14 @@ export const resolveAllowedWorkingDirectory = (
     return null;
   }
 
-  const resolvedPath = path.resolve(requestedPath);
+  const resolvedPath = canonicalizePath(requestedPath);
   if (allowedRoots.length === 0) {
     throw new ConfigError("no allowed roots configured for cwd-sensitive execution");
   }
 
   const allowed = allowedRoots.some((root) => {
-    const resolvedRoot = path.resolve(root);
-    return resolvedPath === resolvedRoot || resolvedPath.startsWith(`${resolvedRoot}${path.sep}`);
+    const canonicalRoot = canonicalizeAllowedRoot(root);
+    return resolvedPath === canonicalRoot || resolvedPath.startsWith(`${canonicalRoot}${path.sep}`);
   });
 
   if (!allowed) {
@@ -26,3 +27,39 @@ export const resolveAllowedWorkingDirectory = (
 
   return resolvedPath;
 };
+
+const canonicalizePath = (targetPath: string): string => {
+  const resolvedPath = path.resolve(targetPath);
+  try {
+    return realpathSync(resolvedPath);
+  } catch (error: unknown) {
+    if (isMissingPathError(error)) {
+      throw new ConfigError(`cwd does not exist: ${resolvedPath}`);
+    }
+    if (isPermissionError(error)) {
+      throw new ConfigError(`cwd permission denied: ${resolvedPath}`);
+    }
+    throw error;
+  }
+};
+
+const canonicalizeAllowedRoot = (targetPath: string): string => {
+  const resolvedPath = path.resolve(targetPath);
+  try {
+    return realpathSync(resolvedPath);
+  } catch (error: unknown) {
+    if (isMissingPathError(error)) {
+      return resolvedPath;
+    }
+    throw error;
+  }
+};
+
+const isMissingPathError = (error: unknown): boolean => getErrorCode(error) === "ENOENT";
+
+const isPermissionError = (error: unknown): boolean => getErrorCode(error) === "EACCES";
+
+const getErrorCode = (error: unknown): string | undefined =>
+  error instanceof Error && "code" in error && typeof error.code === "string"
+    ? error.code
+    : undefined;

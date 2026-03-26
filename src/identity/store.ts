@@ -38,7 +38,11 @@ export const ensureIdentity = async (): Promise<NodeIdentityRecord> => {
 
   const { dataDir, identityFilePath } = resolveStoragePaths();
   await fs.mkdir(dataDir, { recursive: true });
-  await fs.writeFile(identityFilePath, `${JSON.stringify(identity, null, 2)}\n`, "utf8");
+  await fs.writeFile(identityFilePath, `${JSON.stringify(identity, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  await fs.chmod(identityFilePath, 0o600);
   return identity;
 };
 

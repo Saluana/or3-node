@@ -67,8 +67,9 @@ describe("HostFileService", () => {
     const service = new HostFileService({ allowedRoots: [tmpDir] });
     const filePath = path.join(tmpDir, "hello.txt");
     const written = await service.write(filePath, { content_text: "hello world" });
+    const expectedPath = await fs.realpath(filePath);
     expect(written.bytes_transferred).toBeGreaterThan(0);
-    expect(written.path).toBe(filePath);
+    expect(written.path).toBe(expectedPath);
 
     const read = await service.read(filePath, "text");
     expect(read.content_text).toBe("hello world");
@@ -248,6 +249,20 @@ describe("HostFileService", () => {
       () => service.write(path.join(linkDir, "escape.txt"), { content_text: "nope" }),
       "outside allowed roots",
     );
+  });
+
+  test("returns canonical file paths after resolving allowed symlinks", async () => {
+    const service = new HostFileService({ allowedRoots: [tmpDir] });
+    const canonicalPath = path.join(tmpDir, "target.txt");
+    const symlinkPath = path.join(tmpDir, "link.txt");
+    await fs.writeFile(canonicalPath, "hello");
+    await fs.symlink(canonicalPath, symlinkPath);
+
+    const result = await service.read(symlinkPath, "text");
+    const expectedCanonicalPath = await fs.realpath(canonicalPath);
+
+    expect(result.path).toBe(expectedCanonicalPath);
+    expect(result.content_text).toBe("hello");
   });
 
   test("browse defaults to first allowed root when no path provided", async () => {

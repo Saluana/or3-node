@@ -111,6 +111,7 @@ export const AgentEvent = {
   DISCONNECT: "transport.disconnect",
   RECONNECT: "transport.reconnect",
   AUTH_FAIL: "transport.auth_fail",
+  FRAME_INVALID: "transport.frame_invalid",
 
   // Exec lifecycle
   EXEC_START: "exec.start",
@@ -126,6 +127,7 @@ export const AgentEvent = {
   FILE_READ: "file.read",
   FILE_WRITE: "file.write",
   FILE_DELETE: "file.delete",
+  FILE_BROWSE: "file.browse",
 
   // PTY lifecycle
   PTY_OPEN: "pty.open",
