@@ -1,20 +1,20 @@
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+
 export const truncateUtf8 = (value: string, maxBytes: number): string => {
   if (maxBytes <= 0) {
     return "";
   }
-  if (Buffer.byteLength(value, "utf8") <= maxBytes) {
+  const buffer = Buffer.from(value, "utf8");
+  if (buffer.byteLength <= maxBytes) {
     return value;
   }
 
-  let usedBytes = 0;
-  let truncated = "";
-  for (const character of value) {
-    const characterBytes = Buffer.byteLength(character, "utf8");
-    if (usedBytes + characterBytes > maxBytes) {
-      break;
+  for (let end = maxBytes; end >= Math.max(0, maxBytes - 3); end -= 1) {
+    try {
+      return UTF8_DECODER.decode(buffer.subarray(0, end));
+    } catch {
+      continue;
     }
-    truncated += character;
-    usedBytes += characterBytes;
   }
-  return truncated;
+  return "";
 };

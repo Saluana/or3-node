@@ -1,37 +1,25 @@
 import fs from "node:fs/promises";
 
-import type { NodeAgentConfig, NodeAgentState } from "./types.ts";
+import {
+  DEFAULT_NODE_AGENT_CONFIG,
+  DEFAULT_NODE_AGENT_STATE,
+  type NodeAgentConfig,
+  type NodeAgentState,
+  normalizeNodeAgentConfig,
+  normalizeNodeAgentState,
+} from "./types.ts";
 import { resolveStoragePaths } from "../storage/paths.ts";
-
-const defaultConfig = (): NodeAgentConfig => ({
-  controlPlaneUrl: "http://127.0.0.1:3001",
-  bootstrapToken: null,
-  nodeName: null,
-  allowedRoots: [],
-  allowedEnvNames: [],
-});
-
-const defaultState = (): NodeAgentState => ({
-  nodeId: null,
-  enrolledAt: null,
-  approvedAt: null,
-  credential: {
-    token: null,
-    expiresAt: null,
-  },
-});
+import { writePrivateJsonFile } from "../storage/json.ts";
+import { isFileNotFoundError } from "../utils/errors.ts";
 
 export const loadConfig = async (): Promise<NodeAgentConfig> => {
   const { configFilePath } = resolveStoragePaths();
   try {
     const content = await fs.readFile(configFilePath, "utf8");
-    return {
-      ...defaultConfig(),
-      ...(JSON.parse(content) as Partial<NodeAgentConfig>),
-    };
+    return normalizeNodeAgentConfig(JSON.parse(content));
   } catch (error: unknown) {
-    if (isMissingFileError(error)) {
-      return defaultConfig();
+    if (isFileNotFoundError(error)) {
+      return DEFAULT_NODE_AGENT_CONFIG;
     }
     throw error;
   }
@@ -40,11 +28,7 @@ export const loadConfig = async (): Promise<NodeAgentConfig> => {
 export const saveConfig = async (config: NodeAgentConfig): Promise<void> => {
   const { configDir, configFilePath } = resolveStoragePaths();
   await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(configFilePath, `${JSON.stringify(config, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  await fs.chmod(configFilePath, 0o600);
+  await writePrivateJsonFile(configFilePath, config);
 };
 
 export const clearBootstrapToken = async (): Promise<void> => {
@@ -65,29 +49,27 @@ export const loadState = async (): Promise<NodeAgentState> => {
     const [stateContent, credentialContent] = await Promise.all([
       fs.readFile(stateFilePath, "utf8"),
       fs.readFile(credentialFilePath, "utf8").catch((error: unknown) => {
-        if (isMissingFileError(error)) {
+        if (isFileNotFoundError(error)) {
           return "";
         }
         throw error;
       }),
     ]);
-    const parsedState = JSON.parse(stateContent) as Partial<NodeAgentState>;
+    const parsedState = normalizeNodeAgentState(JSON.parse(stateContent));
     const parsedCredentials =
-      credentialContent === ""
-        ? null
-        : (JSON.parse(credentialContent) as Partial<NodeAgentState["credential"]>);
+      credentialContent === "" ? null : normalizeNodeAgentState({ credential: JSON.parse(credentialContent) });
     return {
-      ...defaultState(),
+      ...DEFAULT_NODE_AGENT_STATE,
       ...parsedState,
       credential: {
-        ...defaultState().credential,
+        ...DEFAULT_NODE_AGENT_STATE.credential,
         ...parsedState.credential,
-        ...parsedCredentials,
+        ...(parsedCredentials?.credential ?? {}),
       },
     };
   } catch (error: unknown) {
-    if (isMissingFileError(error)) {
-      return defaultState();
+    if (isFileNotFoundError(error)) {
+      return DEFAULT_NODE_AGENT_STATE;
     }
     throw error;
   }
@@ -103,25 +85,16 @@ export const saveState = async (state: NodeAgentState): Promise<void> => {
       expiresAt: state.credential.expiresAt,
     },
   };
-  await fs.writeFile(stateFilePath, `${JSON.stringify(persistedState, null, 2)}\n`, "utf8");
+  await writePrivateJsonFile(stateFilePath, persistedState);
   if (state.credential.token === null) {
     await fs.rm(credentialFilePath, { force: true });
     return;
   }
 
-  await fs.writeFile(
-    credentialFilePath,
-    `${JSON.stringify(
-      {
-        token: state.credential.token,
-        expiresAt: state.credential.expiresAt,
-      },
-      null,
-      2,
-    )}\n`,
-    { encoding: "utf8", mode: 0o600 },
-  );
-  await fs.chmod(credentialFilePath, 0o600);
+  await writePrivateJsonFile(credentialFilePath, {
+    token: state.credential.token,
+    expiresAt: state.credential.expiresAt,
+  });
 };
 
 export const resetState = async (): Promise<void> => {
@@ -132,6 +105,3 @@ export const resetState = async (): Promise<void> => {
     fs.rm(connectionStateFilePath, { force: true }),
   ]);
 };
-
-const isMissingFileError = (error: unknown): boolean =>
-  error instanceof Error && "code" in error && error.code === "ENOENT";

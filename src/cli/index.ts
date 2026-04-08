@@ -19,7 +19,7 @@ import { collectAgentInfo, formatAgentInfo } from "../info/agent-info.ts";
 import { loadConnectionState, type AgentConnectionState } from "../info/connection-state.ts";
 import { NodeAgentLoop } from "../transport/agent-loop.ts";
 import type { NodeAgentLoopOptions } from "../transport/agent-loop.ts";
-import { CliUsageError, ConfigError } from "../utils/errors.ts";
+import { CliUsageError, ConfigError, toErrorMessage } from "../utils/errors.ts";
 import { AgentEvent, createAgentLogger, type AgentLogger } from "../utils/logger.ts";
 
 export interface CliDependencies {
@@ -386,11 +386,9 @@ const resolveLaunchConfig = (
 
   return {
     ...merged,
-    controlPlaneUrl: merged.controlPlaneUrl,
     bootstrapToken:
       merged.bootstrapToken ??
       resolveOptionalPromptValue(promptImpl, "Bootstrap token (leave empty to skip)", null),
-    nodeName: merged.nodeName,
   };
 };
 
@@ -422,7 +420,7 @@ const renderHelp = (): string =>
 const defaultAgentLoopFactory = (options: NodeAgentLoopOptions): AgentLoopLike =>
   new NodeAgentLoop(options);
 
-const defaultBackgroundLauncher = (argv: readonly string[]): void => {
+const defaultBackgroundLauncher = async (argv: readonly string[]): Promise<void> => {
   const entrypoint = process.argv[1];
   if (entrypoint === undefined) {
     throw new Error(
@@ -516,9 +514,6 @@ const getCredentialState = (state: NodeAgentState): "missing" | "valid" | "expir
 
   return Date.parse(state.credential.expiresAt) <= Date.now() ? "expired" : "valid";
 };
-
-const toErrorMessage = (error: unknown): string =>
-  error instanceof Error ? error.message : "unknown error";
 
 const shouldRedeemBootstrap = (state: Awaited<ReturnType<typeof loadState>>): boolean => {
   if (getCredentialState(state) !== "valid") {

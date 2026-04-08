@@ -42,4 +42,20 @@ describe("connection state persistence", () => {
     expect(state.updatedAt).not.toBeNull();
     expect(await fs.readFile(connectionStateFilePath, "utf8")).toContain("transport failed");
   });
+
+  test("normalizes malformed persisted state", async () => {
+    const { connectionStateFilePath, dataDir } = resolveStoragePaths();
+    await fs.mkdir(dataDir, { recursive: true });
+    await fs.writeFile(
+      connectionStateFilePath,
+      JSON.stringify({ connectionState: "sideways", recentError: 42, updatedAt: false }),
+      "utf8",
+    );
+
+    const state = await loadConnectionState();
+
+    expect(state.connectionState).toBe("unknown");
+    expect(state.recentError).toBeNull();
+    expect(state.updatedAt).toBeNull();
+  });
 });

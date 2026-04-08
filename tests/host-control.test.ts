@@ -231,4 +231,22 @@ describe("HostControlService", () => {
 
     expect(result.status).toBe("timed_out");
   });
+
+  test("evicts old completed exec results when the in-memory cache is full", async () => {
+    const service = new HostControlService({
+      maxConcurrentExecs: 1,
+      maxCompletedExecs: 2,
+    });
+
+    const first = await service.exec({ argv: ["echo", "first"] });
+    const second = await service.exec({ argv: ["echo", "second"] });
+    const third = await service.exec({ argv: ["echo", "third"] });
+    await Promise.all([first.result, second.result, third.result]);
+
+    const snapshots = await service.listExecs();
+    expect(snapshots).toHaveLength(2);
+    expect(await service.getExec(first.execId)).toBeNull();
+    expect(await service.getExec(second.execId)).not.toBeNull();
+    expect(await service.getExec(third.execId)).not.toBeNull();
+  });
 });

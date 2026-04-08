@@ -1,19 +1,19 @@
-import { spawn } from "node:child_process";
-import type { Readable, Writable } from "node:stream";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
 import { createId } from "or3-net";
 
-import type {
-  HostControlConfig,
-  HostExecHandle,
-  HostExecRequest,
-  HostExecResult,
-  HostExecSnapshot,
-  HostExecStatus,
+import {
+  toExecSnapshot,
+  type HostControlConfig,
+  type HostExecHandle,
+  type HostExecRequest,
+  type HostExecResult,
+  type HostExecSnapshot,
+  type HostExecStatus,
 } from "./types.ts";
 import { validateRequestedEnv } from "./env-policy.ts";
 import { resolveAllowedWorkingDirectory } from "./paths.ts";
-import { ConfigError } from "../utils/errors.ts";
+import { ConfigError, toErrorMessage } from "../utils/errors.ts";
 import { truncateUtf8 } from "../utils/utf8.ts";
 import { AgentEvent, createNoopAgentLogger, type AgentLogger } from "../utils/logger.ts";
 
@@ -24,6 +24,7 @@ const DEFAULT_CONFIG: HostControlConfig = {
   maxStdoutBytes: 128 * 1024,
   maxStderrBytes: 128 * 1024,
   maxStdinBytes: 64 * 1024,
+  maxCompletedExecs: 100,
   defaultTimeoutMs: 30_000,
   maxTimeoutMs: 300_000,
 };
@@ -47,14 +48,14 @@ export class HostControlService {
   }
 
   public listExecs(): Promise<readonly HostExecSnapshot[]> {
-    return Promise.resolve([...this.completedExecs.values()].map(toSnapshot));
+    return Promise.resolve([...this.completedExecs.values()].map(toExecSnapshot));
   }
 
   public getExec(execId: string): Promise<HostExecResult | null> {
     return Promise.resolve(this.completedExecs.get(execId) ?? null);
   }
 
-  public exec(input: HostExecRequest): Promise<HostExecHandle> {
+  public exec(input: HostExecRequest): HostExecHandle {
     try {
       const [command, ...args] = input.argv;
       if (command === undefined) {
@@ -109,14 +110,14 @@ export class HostControlService {
         this.activeExecs.delete(execId);
       });
 
-      return Promise.resolve({
+      return {
         execId,
         result,
         abort: (): Promise<void> => {
           this.activeExecs.get(execId)?.abort();
           return Promise.resolve();
         },
-      });
+      };
     } catch (error: unknown) {
       this.logExecSetupFailure(input, error);
       throw error;
@@ -134,7 +135,7 @@ export class HostControlService {
     setAbort: (abort: () => void) => void,
   ): Promise<HostExecResult> {
     const startedAt = new Date().toISOString();
-    const child = spawn(command, [...args], {
+    const child: ChildProcessWithoutNullStreams = spawn(command, [...args], {
       cwd: cwd ?? undefined,
       env:
         input.env === undefined
@@ -144,39 +145,23 @@ export class HostControlService {
               ...input.env,
             },
       stdio: "pipe",
-    }) as {
-      readonly stdout: Readable;
-      readonly stderr: Readable;
-      readonly stdin: Writable;
-      once(event: "error", listener: (error: Error) => void): unknown;
-      once(
-        event: "exit",
-        listener: (code: number | null, signal: NodeJS.Signals | null) => void,
-      ): unknown;
-      kill(signal?: NodeJS.Signals | number): boolean;
-    };
+    });
     setAbort(() => {
       child.kill("SIGTERM");
     });
 
-    let stdout = "";
-    let stderr = "";
-    let stdoutTruncated = false;
-    let stderrTruncated = false;
+    let stdoutState = createBoundedTextState();
+    let stderrState = createBoundedTextState();
     let timedOut = false;
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
-      const next = appendBounded(stdout, chunk, this.config.maxStdoutBytes);
-      stdout = next.value;
-      stdoutTruncated ||= next.truncated;
+      stdoutState = appendBounded(stdoutState, chunk, this.config.maxStdoutBytes);
       input.onStdout?.(chunk);
     });
     child.stderr.on("data", (chunk: string) => {
-      const next = appendBounded(stderr, chunk, this.config.maxStderrBytes);
-      stderr = next.value;
-      stderrTruncated ||= next.truncated;
+      stderrState = appendBounded(stderrState, chunk, this.config.maxStderrBytes);
       input.onStderr?.(chunk);
     });
 
@@ -207,17 +192,17 @@ export class HostControlService {
           argv: [...input.argv],
           cwd,
           status: "failed",
-          stdoutPreview: stdout,
+          stdoutPreview: stdoutState.value,
           stderrPreview: toErrorMessage(error),
-          stdout,
+          stdout: stdoutState.value,
           stderr: toErrorMessage(error),
           startedAt,
           completedAt: new Date().toISOString(),
           exitCode: -1,
           signal: null,
-          truncated: stdoutTruncated || stderrTruncated,
-          stdoutTruncated,
-          stderrTruncated,
+          truncated: stdoutState.truncated || stderrState.truncated,
+          stdoutTruncated: stdoutState.truncated,
+          stderrTruncated: stderrState.truncated,
         };
         this.logger.error(AgentEvent.EXEC_FINISH, "host execution failed before exit", {
           exec_id: execId,
@@ -230,7 +215,7 @@ export class HostControlService {
           stderr_truncated: result.stderrTruncated,
           failure_class: "exec",
         });
-        this.completedExecs.set(execId, result);
+        this.rememberCompletedExec(result);
         return null;
       });
 
@@ -255,22 +240,36 @@ export class HostControlService {
       argv: [...input.argv],
       cwd,
       status,
-      stdoutPreview: stdout,
-      stderrPreview: stderr,
-      stdout,
-      stderr,
+      stdoutPreview: stdoutState.value,
+      stderrPreview: stderrState.value,
+      stdout: stdoutState.value,
+      stderr: stderrState.value,
       startedAt,
       completedAt: new Date().toISOString(),
       exitCode: terminal.code,
       signal: terminal.signal === "" ? null : (terminal.signal as NodeJS.Signals),
-      truncated: stdoutTruncated || stderrTruncated,
-      stdoutTruncated,
-      stderrTruncated,
+      truncated: stdoutState.truncated || stderrState.truncated,
+      stdoutTruncated: stdoutState.truncated,
+      stderrTruncated: stderrState.truncated,
     };
-    this.completedExecs.set(execId, result);
+    this.rememberCompletedExec(result);
     this.logExecResult(result);
     await this.config.onResult?.(result);
     return result;
+  }
+
+  private rememberCompletedExec(result: HostExecResult): void {
+    if (this.config.maxCompletedExecs <= 0) {
+      return;
+    }
+    this.completedExecs.set(result.execId, result);
+    while (this.completedExecs.size > this.config.maxCompletedExecs) {
+      const oldestExecId = this.completedExecs.keys().next().value;
+      if (oldestExecId === undefined) {
+        break;
+      }
+      this.completedExecs.delete(oldestExecId);
+    }
   }
 
   private logExecSetupFailure(input: HostExecRequest, error: unknown): void {
@@ -337,41 +336,41 @@ export class HostControlService {
   }
 }
 
+interface BoundedTextState {
+  readonly value: string;
+  readonly bytes: number;
+  readonly truncated: boolean;
+}
+
+const createBoundedTextState = (): BoundedTextState => ({
+  value: "",
+  bytes: 0,
+  truncated: false,
+});
+
 const appendBounded = (
-  existing: string,
+  existing: BoundedTextState,
   chunk: string,
   maxBytes: number,
-): { value: string; truncated: boolean } => {
-  const nextValue = `${existing}${chunk}`;
-  const nextBuffer = Buffer.from(nextValue, "utf8");
-  if (nextBuffer.byteLength <= maxBytes) {
-    return { value: nextValue, truncated: false };
+): BoundedTextState => {
+  if (existing.truncated) {
+    return existing;
+  }
+  const chunkBytes = Buffer.byteLength(chunk, "utf8");
+  if (existing.bytes + chunkBytes <= maxBytes) {
+    return {
+      value: `${existing.value}${chunk}`,
+      bytes: existing.bytes + chunkBytes,
+      truncated: false,
+    };
   }
 
   return {
-    value: truncateUtf8(nextValue, maxBytes),
+    value: `${existing.value}${truncateUtf8(chunk, maxBytes - existing.bytes)}`,
+    bytes: maxBytes,
     truncated: true,
   };
 };
-
-const toSnapshot = (result: HostExecResult): HostExecSnapshot => ({
-  execId: result.execId,
-  argv: result.argv,
-  cwd: result.cwd,
-  status: result.status,
-  stdoutPreview: result.stdoutPreview,
-  stderrPreview: result.stderrPreview,
-  startedAt: result.startedAt,
-  completedAt: result.completedAt,
-  exitCode: result.exitCode,
-  signal: result.signal,
-  truncated: result.truncated,
-  stdoutTruncated: result.stdoutTruncated,
-  stderrTruncated: result.stderrTruncated,
-});
-
-const toErrorMessage = (error: unknown): string =>
-  error instanceof Error ? error.message : "unknown error";
 
 const isPathViolationMessage = (message: string): boolean =>
   message.includes("outside allowed roots");

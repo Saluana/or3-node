@@ -12,8 +12,23 @@ export interface NodeStoragePaths {
   readonly execHistoryFilePath: string;
 }
 
+interface StoragePathCacheEntry {
+  readonly cacheKey: string;
+  readonly paths: NodeStoragePaths;
+}
+
+let cachedPaths: StoragePathCacheEntry | null = null;
+
 export const resolveStoragePaths = (): NodeStoragePaths => {
   const homeDirectory = process.env.HOME ?? os.homedir();
+  const cacheKey = [
+    homeDirectory,
+    process.env.XDG_CONFIG_HOME ?? "",
+    process.env.XDG_DATA_HOME ?? "",
+  ].join("\u0000");
+  if (cachedPaths?.cacheKey === cacheKey) {
+    return cachedPaths.paths;
+  }
   const configDir =
     process.env.XDG_CONFIG_HOME === undefined
       ? path.join(homeDirectory, ".config", "or3-node")
@@ -22,7 +37,7 @@ export const resolveStoragePaths = (): NodeStoragePaths => {
     process.env.XDG_DATA_HOME === undefined
       ? path.join(homeDirectory, ".local", "share", "or3-node")
       : path.join(process.env.XDG_DATA_HOME, "or3-node");
-  return {
+  const paths = {
     configDir,
     dataDir,
     configFilePath: path.join(configDir, "config.json"),
@@ -31,5 +46,7 @@ export const resolveStoragePaths = (): NodeStoragePaths => {
     credentialFilePath: path.join(dataDir, "credentials.json"),
     identityFilePath: path.join(dataDir, "identity.json"),
     execHistoryFilePath: path.join(dataDir, "exec-history.json"),
-  };
+  } satisfies NodeStoragePaths;
+  cachedPaths = { cacheKey, paths };
+  return paths;
 };

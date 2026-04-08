@@ -357,6 +357,38 @@ describe("node agent loop", () => {
     expect(entries.some((entry) => entry.event === "transport.frame_invalid")).toBe(true);
   });
 
+  test("responds with an invalid_request error when a malformed frame still has a request id", async () => {
+    const socket = new FakeSocket();
+    const loop = new NodeAgentLoop({
+      controlPlaneUrl: "http://or3.test",
+      credential: { token: "or3n_live", expiresAt: "2099-01-01T00:00:00.000Z" },
+      hostControl: new HostControlService(),
+      webSocketFactory: () => socket,
+      reconnectDelayMs: 1,
+      maxReconnectDelayMs: 1,
+    });
+
+    const run = loop.connectOnce();
+    socket.pushInbound(
+      JSON.stringify({
+        type: "request",
+        payload: {
+          id: "req-invalid",
+          method: "execute",
+          params: null,
+        },
+      }),
+    );
+    await Bun.sleep(20);
+    socket.close();
+    await run;
+
+    const response = socket.outbound
+      .map((payload) => JSON.parse(payload) as { payload?: { id?: string; error?: { code?: string } } })
+      .find((frame) => frame.payload?.id === "req-invalid");
+    expect(response?.payload?.error?.code).toBe("invalid_request");
+  });
+
   test("preserves secure websocket URLs when already configured", async () => {
     const requestedUrls: string[] = [];
     const socket = new FakeSocket();
@@ -768,6 +800,67 @@ describe("node agent loop", () => {
     const response = secondSocket.outbound
       .map((payload) => JSON.parse(payload) as { payload?: { id?: string; error?: { code?: string } } })
       .find((frame) => frame.payload?.id === "req-get-session-restart");
+    expect(response?.payload?.error?.code).toBe("session_not_found");
+  });
+
+  test("drops in-memory sessions when the same loop reconnects", async () => {
+    const sockets: FakeSocket[] = [];
+    let attempts = 0;
+    const loop = new NodeAgentLoop({
+      controlPlaneUrl: "http://or3.test",
+      credential: { token: "or3n_live", expiresAt: "2099-01-01T00:00:00.000Z" },
+      hostControl: new HostControlService(),
+      webSocketFactory: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        attempts += 1;
+        if (attempts === 1) {
+          queueMicrotask(() => {
+            socket.pushInbound(
+              JSON.stringify({
+                type: "request",
+                payload: {
+                  id: "req-create-session-reconnect",
+                  method: "create_session",
+                  params: { session_id: "sess_reconnect", workspace_id: "ws_test" },
+                },
+              }),
+            );
+            setTimeout(() => {
+              socket.close();
+            }, 10);
+          });
+        } else {
+          queueMicrotask(() => {
+            socket.pushInbound(
+              JSON.stringify({
+                type: "request",
+                payload: {
+                  id: "req-get-session-reconnect",
+                  method: "get_session",
+                  params: { session_id: "sess_reconnect" },
+                },
+              }),
+            );
+            setTimeout(() => {
+              socket.close();
+            }, 10);
+          });
+        }
+        return socket;
+      },
+      reconnectDelayMs: 1,
+      maxReconnectDelayMs: 1,
+      reconnectJitterRatio: 0,
+    });
+
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 40);
+    await loop.start(controller.signal);
+
+    const response = sockets[1]?.outbound
+      .map((payload) => JSON.parse(payload) as { payload?: { id?: string; error?: { code?: string } } })
+      .find((frame) => frame.payload?.id === "req-get-session-reconnect");
     expect(response?.payload?.error?.code).toBe("session_not_found");
   });
 });

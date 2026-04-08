@@ -9,6 +9,8 @@ import { createId } from "or3-net";
 import { validateRequestedEnv } from "./env-policy.ts";
 import { resolveAllowedWorkingDirectory } from "./paths.ts";
 import { ConfigError } from "../utils/errors.ts";
+import { toErrorMessage } from "../utils/errors.ts";
+import { isPtySupportedPlatform } from "../runtime-capabilities.ts";
 import { AgentEvent, createNoopAgentLogger, type AgentLogger } from "../utils/logger.ts";
 
 export interface PtyOpenRequest {
@@ -67,7 +69,7 @@ export class HostPtyService {
   }
 
   public isSupported(): boolean {
-    return process.platform === "linux" || process.platform === "darwin";
+    return isPtySupportedPlatform();
   }
 
   public open(request: PtyOpenRequest): PtySession {
@@ -187,6 +189,3 @@ export class HostPtyService {
 interface PtySessionHandle extends PtySession {
   readonly terminal: Bun.Terminal;
 }
-
-const toErrorMessage = (error: unknown): string =>
-  error instanceof Error ? error.message : "unknown error";
