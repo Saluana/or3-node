@@ -2,7 +2,9 @@ import fs from "node:fs/promises";
 
 import nacl from "tweetnacl";
 
+import { writePrivateJsonFile } from "../storage/json.ts";
 import { resolveStoragePaths } from "../storage/paths.ts";
+import { isFileNotFoundError } from "../utils/errors.ts";
 
 export interface NodeIdentityRecord {
   readonly publicKeyBase64: string;
@@ -10,13 +12,35 @@ export interface NodeIdentityRecord {
   readonly createdAt: string;
 }
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object";
+
+const normalizeIdentityRecord = (value: unknown): NodeIdentityRecord => {
+  if (!isRecord(value)) {
+    throw new Error("identity file is malformed");
+  }
+  const publicKeyBase64 =
+    typeof value.publicKeyBase64 === "string" ? value.publicKeyBase64 : null;
+  const secretKeyBase64 =
+    typeof value.secretKeyBase64 === "string" ? value.secretKeyBase64 : null;
+  const createdAt = typeof value.createdAt === "string" ? value.createdAt : null;
+  if (publicKeyBase64 === null || secretKeyBase64 === null || createdAt === null) {
+    throw new Error("identity file is malformed");
+  }
+  return {
+    publicKeyBase64,
+    secretKeyBase64,
+    createdAt,
+  };
+};
+
 export const loadIdentity = async (): Promise<NodeIdentityRecord | null> => {
   const { identityFilePath } = resolveStoragePaths();
   try {
     const content = await fs.readFile(identityFilePath, "utf8");
-    return JSON.parse(content) as NodeIdentityRecord;
+    return normalizeIdentityRecord(JSON.parse(content));
   } catch (error: unknown) {
-    if (isMissingFileError(error)) {
+    if (isFileNotFoundError(error)) {
       return null;
     }
     throw error;
@@ -38,11 +62,7 @@ export const ensureIdentity = async (): Promise<NodeIdentityRecord> => {
 
   const { dataDir, identityFilePath } = resolveStoragePaths();
   await fs.mkdir(dataDir, { recursive: true });
-  await fs.writeFile(identityFilePath, `${JSON.stringify(identity, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  await fs.chmod(identityFilePath, 0o600);
+  await writePrivateJsonFile(identityFilePath, identity);
   return identity;
 };
 
@@ -50,6 +70,3 @@ export const resetIdentity = async (): Promise<void> => {
   const { identityFilePath } = resolveStoragePaths();
   await fs.rm(identityFilePath, { force: true });
 };
-
-const isMissingFileError = (error: unknown): boolean =>
-  error instanceof Error && "code" in error && error.code === "ENOENT";

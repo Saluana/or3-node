@@ -144,4 +144,34 @@ describe("HostServiceManager", () => {
     service.stop();
     expect(manager.get(service.serviceId)).toBeNull();
   });
+
+  test("onError receives spawn failures", async () => {
+    let serviceId = "";
+    let errorMessage = "";
+    manager = new HostServiceManager({
+      onError: (nextServiceId, error) => {
+        serviceId = nextServiceId;
+        errorMessage = error.message;
+      },
+    });
+    const service = manager.launch({
+      serviceName: "missing-bin",
+      command: "definitely-not-a-real-service-binary",
+      port: 9001,
+    });
+
+    await new Promise<void>((resolve) => {
+      const check = (): void => {
+        if (errorMessage.length > 0) {
+          resolve();
+        } else {
+          setTimeout(check, 50);
+        }
+      };
+      setTimeout(check, 50);
+    });
+
+    expect(serviceId).toBe(service.serviceId);
+    expect(errorMessage.length).toBeGreaterThan(0);
+  });
 });

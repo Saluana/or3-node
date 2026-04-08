@@ -10,8 +10,14 @@ import {
   saveConnectionState,
   type AgentConnectionState,
 } from "../info/connection-state.ts";
+import { toErrorMessage } from "../utils/errors.ts";
 import { truncateUtf8 } from "../utils/utf8.ts";
-import { AgentEvent, createNoopAgentLogger, type AgentLogger } from "../utils/logger.ts";
+import {
+  AgentEvent,
+  createNoopAgentLogger,
+  type AgentEventName,
+  type AgentLogger,
+} from "../utils/logger.ts";
 
 export interface AgentLoopCredential {
   readonly token: string;
@@ -41,6 +47,7 @@ export interface NodeAgentLoopOptions {
   readonly reconnectJitterRatio?: number;
   readonly random?: () => number;
   readonly sessionLogLimit?: number;
+  readonly maxSessions?: number;
   readonly persistConnectionState?: (
     connectionState: AgentConnectionState,
     recentError?: string | null,
@@ -72,6 +79,7 @@ const DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000;
 const DEFAULT_RECONNECT_JITTER_RATIO = 0.25;
 const DEFAULT_SESSION_LOG_LIMIT = 256;
 const DEFAULT_SESSION_LOG_CHUNK_MAX_BYTES = 8 * 1024;
+const DEFAULT_MAX_SESSIONS = 128;
 
 export class NodeAgentLoop {
   private readonly activeExecs = new Map<string, HostExecHandle>();
@@ -84,6 +92,7 @@ export class NodeAgentLoop {
   private readonly reconnectJitterRatio: number;
   private readonly random: () => number;
   private readonly sessionLogLimit: number;
+  private readonly maxSessions: number;
   private readonly persistConnectionState: (
     connectionState: AgentConnectionState,
     recentError?: string | null,
@@ -102,6 +111,7 @@ export class NodeAgentLoop {
     this.reconnectJitterRatio = options.reconnectJitterRatio ?? DEFAULT_RECONNECT_JITTER_RATIO;
     this.random = options.random ?? Math.random;
     this.sessionLogLimit = options.sessionLogLimit ?? DEFAULT_SESSION_LOG_LIMIT;
+    this.maxSessions = options.maxSessions ?? DEFAULT_MAX_SESSIONS;
     this.persistConnectionState = options.persistConnectionState ?? saveConnectionState;
     this.ptyService =
       options.ptyService ??
@@ -147,8 +157,7 @@ export class NodeAgentLoop {
       if (!closedResolved) {
         closedResolved = true;
         this.currentSocket = null;
-        this.ptyService.closeAll();
-        this.ptyRequestIds.clear();
+        this.clearTransientState();
         resolveClosed?.();
       }
     };
@@ -157,6 +166,15 @@ export class NodeAgentLoop {
     });
     socket.onmessage = (event) => {
       void this.handleIncomingFrame(socket, event.data).catch((error: unknown) => {
+        const requestId = tryReadRequestId(event.data);
+        if (requestId !== null) {
+          socket.send(
+            JSON.stringify({
+              type: "response",
+              payload: errorResult(requestId, "invalid_request", "invalid transport frame"),
+            }),
+          );
+        }
         this.logger.warn(AgentEvent.FRAME_INVALID, "transport received invalid frame", {
           error: toErrorMessage(error),
           failure_class: "transport",
@@ -218,6 +236,12 @@ export class NodeAgentLoop {
     );
   }
 
+  private clearTransientState(): void {
+    this.ptyService.closeAll();
+    this.ptyRequestIds.clear();
+    this.sessions.clear();
+  }
+
   public async start(signal?: AbortSignal): Promise<void> {
     let delayMs = this.reconnectDelayMs;
     while (!signal?.aborted) {
@@ -242,106 +266,29 @@ export class NodeAgentLoop {
   }
 
   private async handleIncomingFrame(socket: WebSocketLike, raw: string): Promise<void> {
-    const frame = nodeTransportFrameSchema.parse(JSON.parse(raw) as NodeTransportFrame);
+    const parsedFrame = JSON.parse(raw) as NodeTransportFrame;
+    const frame = nodeTransportFrameSchema.parse(parsedFrame);
     if (frame.type !== "request") {
       return;
     }
 
-    const response = await this.handleRequest(socket, frame.payload);
+    const response = await this.handleRequest(socket, frame.payload as NodeRequest);
     socket.send(JSON.stringify({ type: "response", payload: response }));
   }
 
   private async handleRequest(
     socket: WebSocketLike,
     request: NodeRequest,
-  ): Promise<{
-    id: string;
-    result?: Record<string, unknown>;
-    error?: { code: string; message: string; retriable: boolean; details: Record<string, unknown> };
-  }> {
+  ): Promise<RpcResult> {
     switch (request.method) {
       case "heartbeat":
-        return { id: request.id, result: { output_text: "ok", artifacts: [], meta: {} } };
-      case "abort": {
-        const handle = this.activeExecs.get(request.params.job_id);
-        if (handle !== undefined) {
-          await handle.abort();
-          this.activeExecs.delete(request.params.job_id);
-        }
-        return { id: request.id, result: { output_text: "aborted", artifacts: [], meta: {} } };
-      }
-      case "execute": {
-        try {
-          const hostRequest = toHostExecRequest(request.params);
-          const sessionId = getTaskPackageSessionId(request.params);
-          let streamChunkClipWarningLogged = false;
-          const handle = await this.options.hostControl.exec({
-            ...hostRequest,
-            onStdout: (chunk): void => {
-              const outputChunk = clipSessionLogChunk(chunk);
-              this.appendSessionLog(sessionId, "stdout", outputChunk.text);
-              if (outputChunk.clipped && !streamChunkClipWarningLogged) {
-                streamChunkClipWarningLogged = true;
-                this.appendSessionLog(
-                  sessionId,
-                  "system",
-                  "output chunk clipped to the session log transport limit",
-                );
-              }
-              socket.send(
-                JSON.stringify({
-                  type: "event",
-                  request_id: request.id,
-                  payload: { event: "output", data: { text: outputChunk.text } },
-                }),
-              );
-            },
-            onStderr: (chunk): void => {
-              const outputChunk = clipSessionLogChunk(chunk);
-              this.appendSessionLog(sessionId, "stderr", outputChunk.text);
-              if (outputChunk.clipped && !streamChunkClipWarningLogged) {
-                streamChunkClipWarningLogged = true;
-                this.appendSessionLog(
-                  sessionId,
-                  "system",
-                  "output chunk clipped to the session log transport limit",
-                );
-              }
-              socket.send(
-                JSON.stringify({
-                  type: "event",
-                  request_id: request.id,
-                  payload: { event: "output", data: { text: outputChunk.text } },
-                }),
-              );
-            },
-          });
-          this.activeExecs.set(request.params.job_id, handle);
-          const result = await handle.result;
-          this.activeExecs.delete(request.params.job_id);
-          this.appendSessionTruncationWarning(sessionId, result);
-          return {
-            id: request.id,
-            result: {
-              output_text: result.stdout,
-              artifacts: [],
-              meta: toExecutionMeta(result),
-            },
-          };
-        } catch (error: unknown) {
-          return {
-            id: request.id,
-            error: {
-              code: "remote_execution_failed",
-              message: error instanceof Error ? error.message : "execution failed",
-              retriable: true,
-              details: {},
-            },
-          };
-        }
-      }
+        return this.handleHeartbeat(request.id);
+      case "abort":
+        return this.handleAbort(request.id, request.params.job_id);
+      case "execute":
+        return this.handleExecute(socket, request.id, request.params);
       case "handshake":
-        return { id: request.id, result: { output_text: "handshake-ok", artifacts: [], meta: {} } };
+        return this.handleHandshake(request.id);
       case "create_session":
         return this.handleCreateSession(request.id, request.params);
       case "get_session":
@@ -373,6 +320,58 @@ export class NodeAgentLoop {
       case "service_stop":
         return this.handleServiceStop(request.id, request.params);
     }
+    return unreachableRequest(request);
+  }
+
+  private handleHeartbeat(requestId: string): RpcResult {
+    return okResult(requestId, { output_text: "ok", artifacts: [], meta: {} });
+  }
+
+  private async handleAbort(requestId: string, jobId: string): Promise<RpcResult> {
+    const handle = this.activeExecs.get(jobId);
+    if (handle !== undefined) {
+      await handle.abort();
+      this.activeExecs.delete(jobId);
+    }
+    return okResult(requestId, { output_text: "aborted", artifacts: [], meta: {} });
+  }
+
+  private async handleExecute(
+    socket: WebSocketLike,
+    requestId: string,
+    taskPackage: TaskPackage,
+  ): Promise<RpcResult> {
+    try {
+      const hostRequest = toHostExecRequest(taskPackage);
+      const sessionId = getTaskPackageSessionId(taskPackage);
+      const handle = this.options.hostControl.exec({
+        ...hostRequest,
+        ...this.createExecutionStreamHandlers(socket, requestId, sessionId),
+      });
+      this.activeExecs.set(taskPackage.job_id, handle);
+      const result = await handle.result;
+      this.activeExecs.delete(taskPackage.job_id);
+      this.appendSessionTruncationWarning(sessionId, result);
+      return okResult(requestId, {
+        output_text: result.stdout,
+        artifacts: [],
+        meta: toExecutionMeta(result),
+      });
+    } catch (error: unknown) {
+      return {
+        id: requestId,
+        error: {
+          code: "remote_execution_failed",
+          message: error instanceof Error ? error.message : "execution failed",
+          retriable: true,
+          details: {},
+        },
+      };
+    }
+  }
+
+  private handleHandshake(requestId: string): RpcResult {
+    return okResult(requestId, { output_text: "handshake-ok", artifacts: [], meta: {} });
   }
 
   private appendSessionLog(
@@ -400,6 +399,56 @@ export class NodeAgentLoop {
     }
   }
 
+  private ensureSessionCapacity(): void {
+    while (this.sessions.size >= this.maxSessions) {
+      const oldestSessionId = this.sessions.keys().next().value;
+      if (oldestSessionId === undefined) {
+        break;
+      }
+      this.sessions.delete(oldestSessionId);
+      this.logger.warn(AgentEvent.SESSION_DESTROY, "agent session evicted from in-memory cache", {
+        session_id: oldestSessionId,
+        failure_class: "transport",
+      });
+    }
+  }
+
+  private createExecutionStreamHandlers(
+    socket: WebSocketLike,
+    requestId: string,
+    sessionId: string | undefined,
+  ): Pick<HostExecRequest, "onStdout" | "onStderr"> {
+    let streamChunkClipWarningLogged = false;
+    const handleChunk = (stream: "stdout" | "stderr", chunk: string): void => {
+      const outputChunk = clipSessionLogChunk(chunk);
+      this.appendSessionLog(sessionId, stream, outputChunk.text);
+      if (outputChunk.clipped && !streamChunkClipWarningLogged) {
+        streamChunkClipWarningLogged = true;
+        this.appendSessionLog(
+          sessionId,
+          "system",
+          "output chunk clipped to the session log transport limit",
+        );
+      }
+      socket.send(
+        JSON.stringify({
+          type: "event",
+          request_id: requestId,
+          payload: { event: "output", data: { text: outputChunk.text } },
+        }),
+      );
+    };
+
+    return {
+      onStdout: (chunk): void => {
+        handleChunk("stdout", chunk);
+      },
+      onStderr: (chunk): void => {
+        handleChunk("stderr", chunk);
+      },
+    };
+  }
+
   private handleCreateSession(
     requestId: string,
     params: { session_id: string; workspace_id: string },
@@ -407,6 +456,7 @@ export class NodeAgentLoop {
     if (this.sessions.has(params.session_id)) {
       return okResult(requestId, { session_id: params.session_id, status: "ready" });
     }
+    this.ensureSessionCapacity();
     const session: AgentSession = {
       sessionId: params.session_id,
       workspaceId: params.workspace_id,
@@ -416,6 +466,10 @@ export class NodeAgentLoop {
       status: "ready",
     };
     this.sessions.set(params.session_id, session);
+    this.logger.info(AgentEvent.SESSION_CREATE, "agent session created", {
+      session_id: params.session_id,
+      workspace_id: params.workspace_id,
+    });
     return okResult(requestId, { session_id: params.session_id, status: "ready" });
   }
 
@@ -438,6 +492,9 @@ export class NodeAgentLoop {
     }
     session.status = "destroyed";
     this.sessions.delete(params.session_id);
+    this.logger.info(AgentEvent.SESSION_DESTROY, "agent session destroyed", {
+      session_id: params.session_id,
+    });
     return okResult(requestId, { destroyed: true });
   }
 
@@ -460,51 +517,13 @@ export class NodeAgentLoop {
     }
     try {
       const argv = [params.command, ...(params.args ?? [])];
-      let streamChunkClipWarningLogged = false;
-      const handle = await this.options.hostControl.exec({
+      const handle = this.options.hostControl.exec({
         argv,
         cwd: params.cwd,
         env: params.env,
         stdin: params.stdin,
         timeoutMs: params.timeout_ms,
-        onStdout: (chunk): void => {
-          const outputChunk = clipSessionLogChunk(chunk);
-          this.appendSessionLog(params.session_id, "stdout", outputChunk.text);
-          if (outputChunk.clipped && !streamChunkClipWarningLogged) {
-            streamChunkClipWarningLogged = true;
-            this.appendSessionLog(
-              params.session_id,
-              "system",
-              "output chunk clipped to the session log transport limit",
-            );
-          }
-          socket.send(
-            JSON.stringify({
-              type: "event",
-              request_id: requestId,
-              payload: { event: "output", data: { text: outputChunk.text } },
-            }),
-          );
-        },
-        onStderr: (chunk): void => {
-          const outputChunk = clipSessionLogChunk(chunk);
-          this.appendSessionLog(params.session_id, "stderr", outputChunk.text);
-          if (outputChunk.clipped && !streamChunkClipWarningLogged) {
-            streamChunkClipWarningLogged = true;
-            this.appendSessionLog(
-              params.session_id,
-              "system",
-              "output chunk clipped to the session log transport limit",
-            );
-          }
-          socket.send(
-            JSON.stringify({
-              type: "event",
-              request_id: requestId,
-              payload: { event: "output", data: { text: outputChunk.text } },
-            }),
-          );
-        },
+        ...this.createExecutionStreamHandlers(socket, requestId, params.session_id),
       });
       const result = await handle.result;
       this.appendSessionTruncationWarning(params.session_id, result);
@@ -1003,11 +1022,8 @@ const toExecutionMeta = (result: HostExecRequestResultLike): Record<string, unkn
   truncation_warnings: buildTruncationWarnings(result),
 });
 
-const getConnectFailureEvent = (message: string): string =>
+const getConnectFailureEvent = (message: string): AgentEventName =>
   /auth|credential|401|403/i.test(message) ? AgentEvent.AUTH_FAIL : AgentEvent.CONNECT;
-
-const toErrorMessage = (error: unknown): string =>
-  error instanceof Error ? error.message : "unknown error";
 
 interface HostExecRequestResultLike {
   readonly exitCode: number | null;
@@ -1018,6 +1034,20 @@ interface HostExecRequestResultLike {
   readonly stdoutTruncated: boolean;
   readonly stderrTruncated: boolean;
 }
+
+const tryReadRequestId = (raw: string): string | null => {
+  try {
+    const parsed = JSON.parse(raw) as { payload?: { id?: unknown } };
+    return typeof parsed.payload?.id === "string" ? parsed.payload.id : null;
+  } catch {
+    return null;
+  }
+};
+
+const unreachableRequest = (request: never): never => {
+  void request;
+  throw new Error("unreachable request method");
+};
 
 interface RpcResult {
   id: string;

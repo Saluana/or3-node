@@ -149,7 +149,7 @@ describe("or3-node cli", () => {
     expect(await fs.readFile(statePath, "utf8")).toContain("devbox-abc123");
   });
 
-  test("launch stores config and identity with owner-only permissions", async () => {
+  test("launch stores config, identity, and state with owner-only permissions", async () => {
     if (process.platform === "win32") {
       return;
     }
@@ -164,11 +164,13 @@ describe("or3-node cli", () => {
     );
 
     expect(exitCode).toBe(0);
-    const { configFilePath, identityFilePath } = resolveStoragePaths();
+    const { configFilePath, identityFilePath, stateFilePath } = resolveStoragePaths();
     const configStat = await fs.stat(configFilePath);
     const identityStat = await fs.stat(identityFilePath);
+    const stateStat = await fs.stat(stateFilePath);
     expect(configStat.mode & 0o777).toBe(0o600);
     expect(identityStat.mode & 0o777).toBe(0o600);
+    expect(stateStat.mode & 0o777).toBe(0o600);
   });
 
   test("launch emits structured bootstrap, approval, and credential logs", async () => {

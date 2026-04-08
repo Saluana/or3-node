@@ -1,7 +1,9 @@
 import fs from "node:fs/promises";
 
-import type { HostExecResult, HostExecSnapshot } from "./types.ts";
+import { type HostExecResult, type HostExecSnapshot, toExecSnapshot } from "./types.ts";
 import { resolveStoragePaths } from "../storage/paths.ts";
+import { writeJsonFile } from "../storage/json.ts";
+import { isFileNotFoundError } from "../utils/errors.ts";
 
 const DEFAULT_HISTORY_LIMIT = 20;
 
@@ -14,7 +16,7 @@ export class HostExecHistoryStore {
       const content = await fs.readFile(execHistoryFilePath, "utf8");
       return normalizeSnapshots(JSON.parse(content));
     } catch (error: unknown) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      if (isFileNotFoundError(error)) {
         return [];
       }
       throw error;
@@ -24,9 +26,9 @@ export class HostExecHistoryStore {
   public async append(result: HostExecResult): Promise<void> {
     const { dataDir, execHistoryFilePath } = resolveStoragePaths();
     const current = await this.list();
-    const next = [toSnapshot(result), ...current].slice(0, this.limit);
+    const next = [toExecSnapshot(result), ...current].slice(0, this.limit);
     await fs.mkdir(dataDir, { recursive: true });
-    await fs.writeFile(execHistoryFilePath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+    await writeJsonFile(execHistoryFilePath, next);
   }
 }
 
@@ -34,22 +36,6 @@ export const resetHostExecHistory = async (): Promise<void> => {
   const { execHistoryFilePath } = resolveStoragePaths();
   await fs.rm(execHistoryFilePath, { force: true });
 };
-
-const toSnapshot = (result: HostExecResult): HostExecSnapshot => ({
-  execId: result.execId,
-  argv: result.argv,
-  cwd: result.cwd,
-  status: result.status,
-  stdoutPreview: result.stdoutPreview,
-  stderrPreview: result.stderrPreview,
-  startedAt: result.startedAt,
-  completedAt: result.completedAt,
-  exitCode: result.exitCode,
-  signal: result.signal,
-  truncated: result.truncated,
-  stdoutTruncated: result.stdoutTruncated,
-  stderrTruncated: result.stderrTruncated,
-});
 
 const normalizeSnapshots = (value: unknown): HostExecSnapshot[] => {
   if (!Array.isArray(value)) {

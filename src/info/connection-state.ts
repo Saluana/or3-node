@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 
+import { writeJsonFile } from "../storage/json.ts";
 import { resolveStoragePaths } from "../storage/paths.ts";
+import { isFileNotFoundError } from "../utils/errors.ts";
 
 export type AgentConnectionState = "connected" | "disconnected" | "unknown";
 
@@ -16,17 +18,32 @@ const defaultConnectionState = (): PersistedConnectionState => ({
   updatedAt: null,
 });
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object";
+
+const normalizeConnectionState = (value: unknown): PersistedConnectionState => {
+  if (!isRecord(value)) {
+    return defaultConnectionState();
+  }
+  return {
+    connectionState:
+      value.connectionState === "connected" ||
+      value.connectionState === "disconnected" ||
+      value.connectionState === "unknown"
+        ? value.connectionState
+        : "unknown",
+    recentError: typeof value.recentError === "string" ? value.recentError : null,
+    updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : null,
+  };
+};
+
 export const loadConnectionState = async (): Promise<PersistedConnectionState> => {
   const { connectionStateFilePath } = resolveStoragePaths();
   try {
     const content = await fs.readFile(connectionStateFilePath, "utf8");
-    const parsed = JSON.parse(content) as Partial<PersistedConnectionState>;
-    return {
-      ...defaultConnectionState(),
-      ...parsed,
-    };
+    return normalizeConnectionState(JSON.parse(content));
   } catch (error: unknown) {
-    if (isMissingFileError(error)) {
+    if (isFileNotFoundError(error)) {
       return defaultConnectionState();
     }
     throw error;
@@ -39,20 +56,9 @@ export const saveConnectionState = async (
 ): Promise<void> => {
   const { dataDir, connectionStateFilePath } = resolveStoragePaths();
   await fs.mkdir(dataDir, { recursive: true });
-  await fs.writeFile(
-    connectionStateFilePath,
-    `${JSON.stringify(
-      {
-        connectionState,
-        recentError,
-        updatedAt: new Date().toISOString(),
-      } satisfies PersistedConnectionState,
-      null,
-      2,
-    )}\n`,
-    "utf8",
-  );
+  await writeJsonFile(connectionStateFilePath, {
+    connectionState,
+    recentError,
+    updatedAt: new Date().toISOString(),
+  } satisfies PersistedConnectionState);
 };
-
-const isMissingFileError = (error: unknown): boolean =>
-  error instanceof Error && "code" in error && error.code === "ENOENT";

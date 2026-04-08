@@ -46,8 +46,25 @@ export interface HostControlConfig {
   readonly maxStdoutBytes: number;
   readonly maxStderrBytes: number;
   readonly maxStdinBytes: number;
+  readonly maxCompletedExecs: number;
   readonly defaultTimeoutMs: number;
   readonly maxTimeoutMs: number;
   readonly onResult?: (result: HostExecResult) => Promise<void> | void;
   readonly logger?: AgentLogger;
 }
+
+export const toExecSnapshot = (result: HostExecResult): HostExecSnapshot => ({
+  execId: result.execId,
+  argv: result.argv,
+  cwd: result.cwd,
+  status: result.status,
+  stdoutPreview: result.stdoutPreview,
+  stderrPreview: result.stderrPreview,
+  startedAt: result.startedAt,
+  completedAt: result.completedAt,
+  exitCode: result.exitCode,
+  signal: result.signal,
+  truncated: result.truncated,
+  stdoutTruncated: result.stdoutTruncated,
+  stderrTruncated: result.stderrTruncated,
+});

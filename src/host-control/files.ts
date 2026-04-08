@@ -8,8 +8,13 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
-import { ConfigError } from "../utils/errors.ts";
-import { AgentEvent, createNoopAgentLogger, type AgentLogger } from "../utils/logger.ts";
+import { ConfigError, toErrorMessage } from "../utils/errors.ts";
+import {
+  AgentEvent,
+  createNoopAgentLogger,
+  type AgentEventName,
+  type AgentLogger,
+} from "../utils/logger.ts";
 
 const DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024;
 
@@ -238,35 +243,44 @@ export class HostFileService {
     currentDepth: number,
   ): Promise<void> {
     const dirEntries = await fs.readdir(dirPath, { withFileTypes: true });
-    for (const entry of dirEntries) {
-      const fullPath = path.join(dirPath, entry.name);
-      if (entry.isDirectory()) {
-        entries.push({ path: fullPath, kind: "directory" });
-        if (currentDepth < maxDepth) {
-          await this.walkDir(fullPath, entries, maxDepth, currentDepth + 1);
+    const discoveredEntries = await Promise.all(
+      dirEntries.map(async (entry): Promise<FileEntry[]> => {
+        const fullPath = path.join(dirPath, entry.name);
+        if (entry.isDirectory()) {
+          const nextEntries: FileEntry[] = [{ path: fullPath, kind: "directory" }];
+          if (currentDepth < maxDepth) {
+            await this.walkDir(fullPath, nextEntries, maxDepth, currentDepth + 1);
+          }
+          return nextEntries;
+        } else if (entry.isFile()) {
+          try {
+            const stat = await fs.stat(fullPath);
+            return [
+              {
+                path: fullPath,
+                kind: "file",
+                size_bytes: stat.size,
+                modified_at: stat.mtime.toISOString(),
+              },
+            ];
+          } catch (error: unknown) {
+            this.logger.warn(AgentEvent.FILE_BROWSE, "host file browse entry metadata unavailable", {
+              path: fullPath,
+              error: toErrorMessage(error),
+            });
+            return [{ path: fullPath, kind: "file" }];
+          }
         }
-      } else if (entry.isFile()) {
-        try {
-          const stat = await fs.stat(fullPath);
-          entries.push({
-            path: fullPath,
-            kind: "file",
-            size_bytes: stat.size,
-            modified_at: stat.mtime.toISOString(),
-          });
-        } catch (error: unknown) {
-          this.logger.warn(AgentEvent.FILE_BROWSE, "host file browse entry metadata unavailable", {
-            path: fullPath,
-            error: toErrorMessage(error),
-          });
-          entries.push({ path: fullPath, kind: "file" });
-        }
-      }
+        return [];
+      }),
+    );
+    for (const group of discoveredEntries) {
+      entries.push(...group);
     }
   }
 
   private logFileFailure(
-    event: string,
+    event: AgentEventName,
     message: string,
     requestedPath: string,
     error: unknown,
@@ -291,6 +305,3 @@ export class HostFileService {
 
 const isNotFoundError = (error: unknown): boolean =>
   error instanceof Error && "code" in error && error.code === "ENOENT";
-
-const toErrorMessage = (error: unknown): string =>
-  error instanceof Error ? error.message : "unknown error";

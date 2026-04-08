@@ -19,79 +19,6 @@ export type AgentFailureClass =
   | "capability_mismatch"
   | "path_violation";
 
-export interface LogEntry {
-  readonly level: LogLevel;
-  readonly event: string;
-  readonly message: string;
-  readonly timestamp: string;
-  readonly details?: Record<string, unknown>;
-}
-
-export interface AgentLogger {
-  debug(event: string, message: string, details?: Record<string, unknown>): void;
-  info(event: string, message: string, details?: Record<string, unknown>): void;
-  warn(event: string, message: string, details?: Record<string, unknown>): void;
-  error(event: string, message: string, details?: Record<string, unknown>): void;
-}
-
-/** Purpose: Creates a structured logger that outputs JSON lines. */
-export const createAgentLogger = (
-  writer: Pick<typeof process.stderr, "write"> = process.stderr,
-  minLevel: LogLevel = "info",
-): AgentLogger => {
-  const levelOrder: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
-  const minLevelNum = levelOrder[minLevel];
-
-  const log = (
-    level: LogLevel,
-    event: string,
-    message: string,
-    details?: Record<string, unknown>,
-  ): void => {
-    if (levelOrder[level] < minLevelNum) {
-      return;
-    }
-    const entry: LogEntry = {
-      level,
-      event,
-      message,
-      timestamp: new Date().toISOString(),
-      ...(details !== undefined ? { details } : {}),
-    };
-    writer.write(`${JSON.stringify(entry)}\n`);
-  };
-
-  return {
-    debug: (event, message, details) => {
-      log("debug", event, message, details);
-    },
-    info: (event, message, details) => {
-      log("info", event, message, details);
-    },
-    warn: (event, message, details) => {
-      log("warn", event, message, details);
-    },
-    error: (event, message, details) => {
-      log("error", event, message, details);
-    },
-  };
-};
-
-export const createNoopAgentLogger = (): AgentLogger => ({
-  debug: () => {
-    return;
-  },
-  info: () => {
-    return;
-  },
-  warn: () => {
-    return;
-  },
-  error: () => {
-    return;
-  },
-});
-
 // Well-known event names for structured logging across the agent.
 export const AgentEvent = {
   CONFIG_FAIL: "config.fail",
@@ -146,3 +73,78 @@ export const AgentEvent = {
   HEALTH_CHECK: "health.check",
   INFO_COLLECT: "info.collect",
 } as const;
+
+export type AgentEventName = (typeof AgentEvent)[keyof typeof AgentEvent];
+
+export interface LogEntry {
+  readonly level: LogLevel;
+  readonly event: AgentEventName;
+  readonly message: string;
+  readonly timestamp: string;
+  readonly details?: Record<string, unknown>;
+}
+
+export interface AgentLogger {
+  debug(event: AgentEventName, message: string, details?: Record<string, unknown>): void;
+  info(event: AgentEventName, message: string, details?: Record<string, unknown>): void;
+  warn(event: AgentEventName, message: string, details?: Record<string, unknown>): void;
+  error(event: AgentEventName, message: string, details?: Record<string, unknown>): void;
+}
+
+/** Purpose: Creates a structured logger that outputs JSON lines. */
+export const createAgentLogger = (
+  writer: Pick<typeof process.stderr, "write"> = process.stderr,
+  minLevel: LogLevel = "info",
+): AgentLogger => {
+  const levelOrder: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
+  const minLevelNum = levelOrder[minLevel];
+
+  const log = (
+    level: LogLevel,
+    event: AgentEventName,
+    message: string,
+    details?: Record<string, unknown>,
+  ): void => {
+    if (levelOrder[level] < minLevelNum) {
+      return;
+    }
+    const entry: LogEntry = {
+      level,
+      event,
+      message,
+      timestamp: new Date().toISOString(),
+      ...(details !== undefined ? { details } : {}),
+    };
+    writer.write(`${JSON.stringify(entry)}\n`);
+  };
+
+  return {
+    debug: (event, message, details) => {
+      log("debug", event, message, details);
+    },
+    info: (event, message, details) => {
+      log("info", event, message, details);
+    },
+    warn: (event, message, details) => {
+      log("warn", event, message, details);
+    },
+    error: (event, message, details) => {
+      log("error", event, message, details);
+    },
+  };
+};
+
+export const createNoopAgentLogger = (): AgentLogger => ({
+  debug: () => {
+    return;
+  },
+  info: () => {
+    return;
+  },
+  warn: () => {
+    return;
+  },
+  error: () => {
+    return;
+  },
+});

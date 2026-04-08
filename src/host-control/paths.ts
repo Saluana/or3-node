@@ -1,7 +1,7 @@
 import { realpathSync } from "node:fs";
 import path from "node:path";
 
-import { ConfigError } from "../utils/errors.ts";
+import { ConfigError, getErrorCode, isPermissionDeniedError } from "../utils/errors.ts";
 
 export const resolveAllowedWorkingDirectory = (
   requestedPath: string | undefined,
@@ -36,7 +36,7 @@ const canonicalizePath = (targetPath: string): string => {
     if (isMissingPathError(error)) {
       throw new ConfigError(`cwd does not exist: ${resolvedPath}`);
     }
-    if (isPermissionError(error)) {
+    if (isPermissionDeniedError(error)) {
       throw new ConfigError(`cwd permission denied: ${resolvedPath}`);
     }
     throw error;
@@ -56,10 +56,3 @@ const canonicalizeAllowedRoot = (targetPath: string): string => {
 };
 
 const isMissingPathError = (error: unknown): boolean => getErrorCode(error) === "ENOENT";
-
-const isPermissionError = (error: unknown): boolean => getErrorCode(error) === "EACCES";
-
-const getErrorCode = (error: unknown): string | undefined =>
-  error instanceof Error && "code" in error && typeof error.code === "string"
-    ? error.code
-    : undefined;

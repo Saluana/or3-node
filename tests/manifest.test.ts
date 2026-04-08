@@ -52,4 +52,10 @@ describe("buildSignedManifest", () => {
 
     expect(manifest.version).toBe(AGENT_VERSION);
   });
+
+  test("reports a concrete disk capacity", () => {
+    const manifest = buildSignedManifest(createIdentity(), createConfig());
+
+    expect(manifest.resource_limits.disk_mb).toBeGreaterThan(0);
+  });
 });

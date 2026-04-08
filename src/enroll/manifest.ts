@@ -1,10 +1,13 @@
+import { existsSync, statfsSync } from "node:fs";
 import os from "node:os";
+import path from "node:path";
 
 import { signNodeManifest } from "or3-net";
 import type { NodeManifest } from "or3-net";
 
 import type { NodeAgentConfig } from "../config/types.ts";
 import type { NodeIdentityRecord } from "../identity/store.ts";
+import { resolveStoragePaths } from "../storage/paths.ts";
 import { getAdvertisedCapabilityList } from "../runtime-capabilities.ts";
 import { AGENT_VERSION } from "../version.ts";
 
@@ -21,14 +24,14 @@ export const buildSignedManifest = (
     node_id: nodeId,
     pubkey: identity.publicKeyBase64,
     adapter_kind: "remote",
-    capabilities: buildCapabilities(config),
+    capabilities: getAdvertisedCapabilityList(config),
     isolation_class: "host-trusted",
     supports_transports: ["outbound-wss", "https"],
     resource_limits: {
       max_concurrent_jobs: DEFAULT_MAX_CONCURRENT_JOBS,
       cpu_cores: Math.max(1, os.cpus().length),
       memory_mb: Math.max(512, Math.floor(os.totalmem() / 1024 / 1024)),
-      disk_mb: 1024 * 100,
+      disk_mb: detectDiskCapacityMb(),
     },
     lease_policy: {
       max_ttl_seconds: DEFAULT_MAX_TTL_SECONDS,
@@ -61,6 +64,24 @@ const buildNodeId = (publicKeyBase64: string, nodeName: string | null): string =
   return `${prefix}-${suffix}`;
 };
 
-const buildCapabilities = (config: NodeAgentConfig): string[] => {
-  return getAdvertisedCapabilityList(config);
+const detectDiskCapacityMb = (): number => {
+  try {
+    const storagePath = findExistingPath(resolveStoragePaths().dataDir);
+    const fileSystemStats = statfsSync(storagePath);
+    return Math.max(1, Math.floor((fileSystemStats.bsize * fileSystemStats.blocks) / 1024 / 1024));
+  } catch {
+    return 1024;
+  }
+};
+
+const findExistingPath = (targetPath: string): string => {
+  let currentPath = path.resolve(targetPath);
+  while (!existsSync(currentPath)) {
+    const parentPath = path.dirname(currentPath);
+    if (parentPath === currentPath) {
+      return process.cwd();
+    }
+    currentPath = parentPath;
+  }
+  return currentPath;
 };

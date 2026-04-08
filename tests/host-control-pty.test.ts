@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import { HostPtyService } from "../src/host-control/pty.ts";
+import { isPtySupportedPlatform } from "../src/runtime-capabilities.ts";
 import { createAgentLogger, type LogEntry } from "../src/utils/logger.ts";
 
-const PTY_SUPPORTED = process.platform === "linux" || process.platform === "darwin";
+const PTY_SUPPORTED = isPtySupportedPlatform();
 
 const createLogWriter = (): {
   readonly chunks: string[];

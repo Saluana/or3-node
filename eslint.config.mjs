@@ -20,7 +20,7 @@ export default tseslint.config(
       },
     },
     settings: {
-      "import/core-modules": ["bun:test", "bun:jsc", "node:fs", "node:path", "node:os"],
+      "import/core-modules": ["bun:test", "bun:jsc", "node:fs", "node:path", "node:os", "or3-net"],
       "import/resolver": {
         typescript: true,
       },
