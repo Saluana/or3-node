@@ -229,11 +229,14 @@ const handleLaunch = async (
     return 0;
   }
 
-  await (dependencies.backgroundLauncher ?? defaultBackgroundLauncher)([
-    "launch",
-    "--foreground",
-    "--no-interactive",
-  ]);
+  const backgroundLauncher = dependencies.backgroundLauncher ?? defaultBackgroundLauncher;
+  await Promise.resolve(
+    backgroundLauncher([
+      "launch",
+      "--foreground",
+      "--no-interactive",
+    ]),
+  );
   stdout.write("agent loop: background launch requested\n");
   stdout.write(
     'next step: run "or3-node status" to inspect local state, or use "--foreground" to keep it attached here\n',
@@ -420,7 +423,7 @@ const renderHelp = (): string =>
 const defaultAgentLoopFactory = (options: NodeAgentLoopOptions): AgentLoopLike =>
   new NodeAgentLoop(options);
 
-const defaultBackgroundLauncher = (argv: readonly string[]): Promise<void> => {
+const defaultBackgroundLauncher = (argv: readonly string[]): void => {
   const entrypoint = process.argv[1];
   if (entrypoint === undefined) {
     throw new Error(
@@ -433,7 +436,6 @@ const defaultBackgroundLauncher = (argv: readonly string[]): Promise<void> => {
     env: buildBackgroundLaunchEnv(),
   });
   child.unref();
-  return Promise.resolve();
 };
 
 const buildBackgroundLaunchEnv = (): NodeJS.ProcessEnv =>

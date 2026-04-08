@@ -7,6 +7,7 @@ export const writeJsonFile = async (filePath: string, value: unknown): Promise<v
 };
 
 export const writePrivateJsonFile = async (filePath: string, value: unknown): Promise<void> => {
+  // Create new files with owner-only permissions, then force existing files back to 0o600.
   const handle = await fs.open(filePath, "w", 0o600);
   await handle.writeFile(formatJson(value), "utf8");
   await handle.close();
