@@ -9,7 +9,12 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 
 import { ConfigError, toErrorMessage } from "../utils/errors.ts";
-import { AgentEvent, createNoopAgentLogger, type AgentLogger } from "../utils/logger.ts";
+import {
+  AgentEvent,
+  createNoopAgentLogger,
+  type AgentEventName,
+  type AgentLogger,
+} from "../utils/logger.ts";
 
 const DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024;
 
@@ -268,7 +273,7 @@ export class HostFileService {
   }
 
   private logFileFailure(
-    event: string,
+    event: AgentEventName,
     message: string,
     requestedPath: string,
     error: unknown,

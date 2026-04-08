@@ -83,6 +83,12 @@ describe("persisted file validation", () => {
       "utf8",
     );
 
-    await expect(loadIdentity()).rejects.toThrow("identity file is malformed");
+    try {
+      await loadIdentity();
+      throw new Error("expected malformed identity to throw");
+    } catch (error: unknown) {
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain("identity file is malformed");
+    }
   });
 });

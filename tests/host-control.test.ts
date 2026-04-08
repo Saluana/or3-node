@@ -35,7 +35,7 @@ const parseLogEntries = (chunks: readonly string[]): LogEntry[] =>
 describe("HostControlService", () => {
   test("executes argv-based commands", async () => {
     const service = new HostControlService({ maxConcurrentExecs: 1 });
-    const handle = await service.exec({ argv: ["echo", "hello"] });
+    const handle = service.exec({ argv: ["echo", "hello"] });
     const result = await handle.result;
 
     expect(result.status).toBe("completed");
@@ -49,7 +49,7 @@ describe("HostControlService", () => {
       logger: createAgentLogger(logs.writer),
     });
 
-    const handle = await service.exec({ argv: ["echo", "logged"] });
+    const handle = service.exec({ argv: ["echo", "logged"] });
     const result = await handle.result;
 
     expect(result.status).toBe("completed");
@@ -100,7 +100,7 @@ describe("HostControlService", () => {
 
   test("aborts long-running commands", async () => {
     const service = new HostControlService({ maxConcurrentExecs: 1 });
-    const handle = await service.exec({ argv: ["sleep", "5"], timeoutMs: 5_000 });
+    const handle = service.exec({ argv: ["sleep", "5"], timeoutMs: 5_000 });
     await handle.abort();
     const result = await handle.result;
 
@@ -116,7 +116,7 @@ describe("HostControlService", () => {
 
   test("returns a failed result when the binary is missing", async () => {
     const service = new HostControlService();
-    const handle = await service.exec({ argv: ["definitely-not-a-real-or3-binary"] });
+    const handle = service.exec({ argv: ["definitely-not-a-real-or3-binary"] });
     const result = await handle.result;
 
     expect(result.status).toBe("failed");
@@ -135,7 +135,7 @@ describe("HostControlService", () => {
 
   test("caps oversized stdout output", async () => {
     const service = new HostControlService({ maxStdoutBytes: 32, maxConcurrentExecs: 1 });
-    const handle = await service.exec({ argv: ["python3", "-c", 'print("x" * 128)'] });
+    const handle = service.exec({ argv: ["python3", "-c", 'print("x" * 128)'] });
     const result = await handle.result;
 
     expect(result.status).toBe("completed");
@@ -147,7 +147,7 @@ describe("HostControlService", () => {
 
   test("caps oversized stderr output separately", async () => {
     const service = new HostControlService({ maxStderrBytes: 24, maxConcurrentExecs: 1 });
-    const handle = await service.exec({
+    const handle = service.exec({
       argv: ["python3", "-c", 'import sys; sys.stderr.write("e" * 128)'],
     });
     const result = await handle.result;
@@ -162,7 +162,7 @@ describe("HostControlService", () => {
   test("truncates stdout on UTF-8 character boundaries", async () => {
     const emoji = "😀";
     const service = new HostControlService({ maxStdoutBytes: 10, maxConcurrentExecs: 1 });
-    const handle = await service.exec({
+    const handle = service.exec({
       argv: ["python3", "-c", `import sys; sys.stdout.write(${JSON.stringify(emoji.repeat(3))})`],
     });
     const result = await handle.result;
@@ -179,7 +179,7 @@ describe("HostControlService", () => {
     const history = new HostExecHistoryStore();
     const service = new HostControlService({ onResult: (result) => history.append(result) });
 
-    const handle = await service.exec({ argv: ["echo", "persisted"] });
+    const handle = service.exec({ argv: ["echo", "persisted"] });
     await handle.result;
 
     const snapshots = await history.list();
@@ -226,7 +226,7 @@ describe("HostControlService", () => {
       defaultTimeoutMs: 5,
       maxTimeoutMs: 5,
     });
-    const handle = await service.exec({ argv: ["sleep", "1"] });
+    const handle = service.exec({ argv: ["sleep", "1"] });
     const result = await handle.result;
 
     expect(result.status).toBe("timed_out");
@@ -234,13 +234,13 @@ describe("HostControlService", () => {
 
   test("evicts old completed exec results when the in-memory cache is full", async () => {
     const service = new HostControlService({
-      maxConcurrentExecs: 1,
+      maxConcurrentExecs: 3,
       maxCompletedExecs: 2,
     });
 
-    const first = await service.exec({ argv: ["echo", "first"] });
-    const second = await service.exec({ argv: ["echo", "second"] });
-    const third = await service.exec({ argv: ["echo", "third"] });
+    const first = service.exec({ argv: ["echo", "first"] });
+    const second = service.exec({ argv: ["echo", "second"] });
+    const third = service.exec({ argv: ["echo", "third"] });
     await Promise.all([first.result, second.result, third.result]);
 
     const snapshots = await service.listExecs();

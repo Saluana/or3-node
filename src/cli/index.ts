@@ -420,7 +420,7 @@ const renderHelp = (): string =>
 const defaultAgentLoopFactory = (options: NodeAgentLoopOptions): AgentLoopLike =>
   new NodeAgentLoop(options);
 
-const defaultBackgroundLauncher = async (argv: readonly string[]): Promise<void> => {
+const defaultBackgroundLauncher = (argv: readonly string[]): Promise<void> => {
   const entrypoint = process.argv[1];
   if (entrypoint === undefined) {
     throw new Error(
@@ -433,6 +433,7 @@ const defaultBackgroundLauncher = async (argv: readonly string[]): Promise<void>
     env: buildBackgroundLaunchEnv(),
   });
   child.unref();
+  return Promise.resolve();
 };
 
 const buildBackgroundLaunchEnv = (): NodeJS.ProcessEnv =>

@@ -57,7 +57,12 @@ export const loadState = async (): Promise<NodeAgentState> => {
     ]);
     const parsedState = normalizeNodeAgentState(JSON.parse(stateContent));
     const parsedCredentials =
-      credentialContent === "" ? null : normalizeNodeAgentState({ credential: JSON.parse(credentialContent) });
+      credentialContent === ""
+        ? null
+        : (() => {
+            const credential = JSON.parse(credentialContent) as unknown;
+            return normalizeNodeAgentState({ credential });
+          })();
     return {
       ...DEFAULT_NODE_AGENT_STATE,
       ...parsedState,

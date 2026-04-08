@@ -12,7 +12,12 @@ import {
 } from "../info/connection-state.ts";
 import { toErrorMessage } from "../utils/errors.ts";
 import { truncateUtf8 } from "../utils/utf8.ts";
-import { AgentEvent, createNoopAgentLogger, type AgentLogger } from "../utils/logger.ts";
+import {
+  AgentEvent,
+  createNoopAgentLogger,
+  type AgentEventName,
+  type AgentLogger,
+} from "../utils/logger.ts";
 
 export interface AgentLoopCredential {
   readonly token: string;
@@ -267,7 +272,7 @@ export class NodeAgentLoop {
       return;
     }
 
-    const response = await this.handleRequest(socket, frame.payload);
+    const response = await this.handleRequest(socket, frame.payload as NodeRequest);
     socket.send(JSON.stringify({ type: "response", payload: response }));
   }
 
@@ -315,6 +320,7 @@ export class NodeAgentLoop {
       case "service_stop":
         return this.handleServiceStop(request.id, request.params);
     }
+    return unreachableRequest(request);
   }
 
   private handleHeartbeat(requestId: string): RpcResult {
@@ -1016,7 +1022,7 @@ const toExecutionMeta = (result: HostExecRequestResultLike): Record<string, unkn
   truncation_warnings: buildTruncationWarnings(result),
 });
 
-const getConnectFailureEvent = (message: string): string =>
+const getConnectFailureEvent = (message: string): AgentEventName =>
   /auth|credential|401|403/i.test(message) ? AgentEvent.AUTH_FAIL : AgentEvent.CONNECT;
 
 interface HostExecRequestResultLike {
@@ -1036,6 +1042,11 @@ const tryReadRequestId = (raw: string): string | null => {
   } catch {
     return null;
   }
+};
+
+const unreachableRequest = (request: never): never => {
+  void request;
+  throw new Error("unreachable request method");
 };
 
 interface RpcResult {

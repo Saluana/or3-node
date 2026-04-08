@@ -1,3 +1,3 @@
 import packageMetadata from "../package.json";
 
-export const AGENT_VERSION = packageMetadata.version ?? "0.0.0";
+export const AGENT_VERSION = packageMetadata.version;

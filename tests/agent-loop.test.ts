@@ -855,7 +855,9 @@ describe("node agent loop", () => {
     });
 
     const controller = new AbortController();
-    setTimeout(() => controller.abort(), 40);
+    setTimeout(() => {
+      controller.abort();
+    }, 40);
     await loop.start(controller.signal);
 
     const response = sockets[1]?.outbound
