@@ -219,7 +219,7 @@ export class HostControlService {
         return result;
       });
 
-    if ("execId" in terminal) {
+    if (isHostExecResult(terminal)) {
       return terminal;
     }
 
@@ -343,6 +343,10 @@ const createBoundedTextState = (): BoundedTextState => ({
   bytes: 0,
   truncated: false,
 });
+
+const isHostExecResult = (
+  value: HostExecResult | { code: number; signal: string; aborted: boolean },
+): value is HostExecResult => "execId" in value;
 
 const appendBounded = (
   existing: BoundedTextState,

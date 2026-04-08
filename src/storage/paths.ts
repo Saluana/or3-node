@@ -25,8 +25,9 @@ export const resolveStoragePaths = (): NodeStoragePaths => {
     homeDirectory,
     process.env.XDG_CONFIG_HOME ?? "",
     process.env.XDG_DATA_HOME ?? "",
-  ].join("\u0000");
-  if (cachedPaths?.cacheKey === cacheKey) {
+  ];
+  const serializedCacheKey = JSON.stringify(cacheKey);
+  if (cachedPaths?.cacheKey === serializedCacheKey) {
     return cachedPaths.paths;
   }
   const configDir =
@@ -47,6 +48,6 @@ export const resolveStoragePaths = (): NodeStoragePaths => {
     identityFilePath: path.join(dataDir, "identity.json"),
     execHistoryFilePath: path.join(dataDir, "exec-history.json"),
   } satisfies NodeStoragePaths;
-  cachedPaths = { cacheKey, paths };
+  cachedPaths = { cacheKey: serializedCacheKey, paths };
   return paths;
 };

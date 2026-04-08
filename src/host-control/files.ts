@@ -243,33 +243,40 @@ export class HostFileService {
     currentDepth: number,
   ): Promise<void> {
     const dirEntries = await fs.readdir(dirPath, { withFileTypes: true });
-    await Promise.all(
-      dirEntries.map(async (entry) => {
+    const discoveredEntries = await Promise.all(
+      dirEntries.map(async (entry): Promise<FileEntry[]> => {
         const fullPath = path.join(dirPath, entry.name);
         if (entry.isDirectory()) {
-          entries.push({ path: fullPath, kind: "directory" });
+          const nextEntries: FileEntry[] = [{ path: fullPath, kind: "directory" }];
           if (currentDepth < maxDepth) {
-            await this.walkDir(fullPath, entries, maxDepth, currentDepth + 1);
-        }
-      } else if (entry.isFile()) {
-        try {
-          const stat = await fs.stat(fullPath);
-          entries.push({
-            path: fullPath,
-            kind: "file",
-            size_bytes: stat.size,
-            modified_at: stat.mtime.toISOString(),
-          });
+            await this.walkDir(fullPath, nextEntries, maxDepth, currentDepth + 1);
+          }
+          return nextEntries;
+        } else if (entry.isFile()) {
+          try {
+            const stat = await fs.stat(fullPath);
+            return [
+              {
+                path: fullPath,
+                kind: "file",
+                size_bytes: stat.size,
+                modified_at: stat.mtime.toISOString(),
+              },
+            ];
           } catch (error: unknown) {
             this.logger.warn(AgentEvent.FILE_BROWSE, "host file browse entry metadata unavailable", {
               path: fullPath,
               error: toErrorMessage(error),
             });
-            entries.push({ path: fullPath, kind: "file" });
+            return [{ path: fullPath, kind: "file" }];
           }
         }
+        return [];
       }),
     );
+    for (const group of discoveredEntries) {
+      entries.push(...group);
+    }
   }
 
   private logFileFailure(
