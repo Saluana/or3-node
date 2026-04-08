@@ -8,8 +8,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
 import { createId } from "or3-net";
 
-import { ConfigError } from "../utils/errors.ts";
-import { toErrorMessage } from "../utils/errors.ts";
+import { ConfigError, toErrorMessage } from "../utils/errors.ts";
 import { AgentEvent, createNoopAgentLogger, type AgentLogger } from "../utils/logger.ts";
 
 export interface ServiceLaunchRequest {

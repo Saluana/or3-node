@@ -216,15 +216,11 @@ export class HostControlService {
           failure_class: "exec",
         });
         this.rememberCompletedExec(result);
-        return null;
+        return result;
       });
 
-    if (terminal === null) {
-      const failedResult = this.completedExecs.get(execId);
-      if (failedResult === undefined) {
-        throw new Error(`host exec result was not recorded for ${execId}`);
-      }
-      return failedResult;
+    if ("execId" in terminal) {
+      return terminal;
     }
 
     const status: HostExecStatus = timedOut

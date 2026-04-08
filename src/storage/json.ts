@@ -7,6 +7,8 @@ export const writeJsonFile = async (filePath: string, value: unknown): Promise<v
 };
 
 export const writePrivateJsonFile = async (filePath: string, value: unknown): Promise<void> => {
-  await writeJsonFile(filePath, value);
+  const handle = await fs.open(filePath, "w", 0o600);
+  await handle.writeFile(formatJson(value), "utf8");
+  await handle.close();
   await fs.chmod(filePath, 0o600);
 };

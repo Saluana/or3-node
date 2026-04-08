@@ -8,8 +8,7 @@ import { createId } from "or3-net";
 
 import { validateRequestedEnv } from "./env-policy.ts";
 import { resolveAllowedWorkingDirectory } from "./paths.ts";
-import { ConfigError } from "../utils/errors.ts";
-import { toErrorMessage } from "../utils/errors.ts";
+import { ConfigError, toErrorMessage } from "../utils/errors.ts";
 import { isPtySupportedPlatform } from "../runtime-capabilities.ts";
 import { AgentEvent, createNoopAgentLogger, type AgentLogger } from "../utils/logger.ts";
 
